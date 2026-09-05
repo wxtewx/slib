@@ -805,16 +805,26 @@ testmkdir() {
 
 ##################################################################################################
 # 函数名：testcp
-# 功能：目标文件不存在时才复制文件，避免覆盖已有文件
+# 功能：仅当目标路径不存在时执行复制，不会覆盖已存在的文件/目录；支持批量源、目录递归复制
 # 全局变量: 无
-# 选项说明: $1=源文件，$2=目标文件
-# 返回值: cp返回码
-# 依赖：cp
+# 参数说明: $1=源文件/源目录(支持通配符), $2=目标存放目录
+# 返回值: cp 命令执行返回码
+# 依赖：cp、log_debug
 ##################################################################################################
+# 目标不存在才执行复制，跳过已存在对象
 testcp() {
-  if [ ! -e "$2" ]; then
-    cp "$1" "$2"
-  fi
+  for item in $1; do
+    dest_path="$2/$(basename "$item")"
+    if [ ! -e "$dest_path" ]; then
+      if [ -d "$item" ]; then
+        cp -r "$item" "$2"
+        log_debug "目录 $item 已复制到 $2。"
+      else
+        cp "$item" "$2"
+        log_debug "文件 $item 已复制到 $2。"
+      fi
+    fi
+  done
 }
 
 ##################################################################################################
@@ -992,6 +1002,46 @@ set_hostname() {
 }
 
 ##################################################################################################
+# 函数名：set_domain
+# 功能：设置完整合格域名；支持传入参数强制指定域名，无参数则交互式提示用户输入；最多4次校验重试
+# 全局变量: IPADDR
+# 参数说明: $1(可选)：强制设置的域名，提供该参数则跳过交互输入
+# 返回值: 无返回值；校验失败达到最大重试次数调用fatal终止脚本；成功后赋值至全局变量IPADDR
+# 依赖：is_fully_qualified、log_error、log_warning、log_debug、fatal、stty、read
+##################################################################################################
+set_domain() {
+  local i=0
+  local forcedomain
+  if [ -n "$1" ]; then
+    forcedomain=$1
+  fi
+  while [ $i -le 3 ]; do
+    if [ -z "$forcedomain" ]; then
+      local name
+      name=$IPADDR
+      log_error "您的域名 $name 不完全符合。"
+      printf "请输入完全符合的域名（例如：www.abc.com）： "
+      stty echo 1>/dev/null 2>&1
+      read -r line
+      stty -echo 1>/dev/null 2>&1
+    else
+      log_debug "将域名设置为 $forcedomain"
+      line=$forcedomain
+    fi
+    if ! is_fully_qualified "$line"; then
+      i=$((i + 1))
+      log_warning "域名 $line 不完全符合."
+      if [ "$i" = "4" ]; then
+        fatal "无法设置完全符合的域名."
+      fi
+    else
+      IPADDR=$line
+      i=4
+    fi
+  done
+}
+
+##################################################################################################
 # 函数名：is_fully_qualified
 # 功能：校验字符串是否为合法FQDN/IPv4/IPv6，拦截localhost、*.localdomain、*.internal等非法域名
 # 全局变量: 无
@@ -1002,13 +1052,13 @@ set_hostname() {
 is_fully_qualified() {
   # 检查是否是有效的IPv4地址
   if echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-    log_debug "输入是有效的 IPv4 地址: $1"
+    log_debug "输入是有效的IPv4地址: $1"
     return 0
   fi
 
   # 检查是否是有效的IPv6地址（简化验证）
   if echo "$1" | grep -Eq '^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$'; then
-    log_debug "输入是有效的 IPv6 地址: $1"
+    log_debug "输入是有效的IPv6地址: $1"
     return 0
   fi
 
@@ -1736,41 +1786,122 @@ init_package_manager() {
 
 ##################################################################################################
 # 函数名：check_install
-# 功能：批量检测软件包是否缺失，缺失则调用run执行安装；检测时强制C英文环境规避本地化文本干扰
-# 全局变量: install_info、install、installtype
-# 选项说明: 参数为多个软件包名
-# 返回值: 无
-# 依赖：run、DEBIAN_FRONTEND环境变量
+# 功能：批量检查软件包安装状态，未安装则执行安装；支持在线OLI/离线OFI两种模式，兼容apt/dnf/yum包管理器
+# 全局变量: menu install_cmd install_info install offline_info offline_install DEBIAN_FRONTEND
+# 参数说明: $@ 需要检测/安装的软件包列表
+# 返回值: 无返回值；不支持的包管理器直接返回0
+# 依赖：run、log_debug、grep
 ##################################################################################################
 check_install() {
   DEBIAN_FRONTEND="noninteractive"
-  for package in "$@"; do
-    # 检测时强制英文环境，消除中文本地化输出干扰
-    Installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
-    local need_install=0
-
-    case $installtype in
-    dnf)
-      if echo "$Installed" | grep -qE "Available Packages"; then
-        need_install=1
-      fi
-      ;;
-    yum)
-      if echo "$Installed" | grep -qE "package"; then
-        need_install=1
-      fi
-      ;;
-    apt | apt-get)
-      if echo "$Installed" | grep -qE "(none)"; then
-        need_install=1
-      fi
-      ;;
+  local package installed cmd
+  # 内部函数：获取检查字符串
+  get_check_str() {
+    case "$1" in
+    apt | apt-get) echo "(none)" ;;
+    dnf | yum) echo "Available Packages" ;;
+    *) echo "" ;;
     esac
-
-    if [ "$need_install" -eq 1 ]; then
-      run ok "$install $package" "安装 $package"
+  }
+  # 获取检查字符串
+  local check_str
+  check_str=$(get_check_str "$install_cmd")
+  [ -z "$check_str" ] && return 0 # 完全不支持的包管理器，直接返回
+  for package in "$@"; do
+    installed=""
+    cmd=""
+    # 确定命令
+    case "$menu:$install_cmd" in
+    "OLI:"*)
+      installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
+      cmd="$install $package"
+      ;;
+    "OFI:dnf" | "OFI:yum")
+      installed=$(LC_ALL=C LANG=C eval "$offline_info \"$package\"" 2>/dev/null)
+      cmd="$offline_install $package"
+      ;;
+    "OFI:apt" | "OFI:apt-get")
+      installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
+      cmd="$install $package"
+      ;;
+    *) continue ;;
+    esac
+    # 检查并执行
+    if [ -z "$installed" ]; then
+      log_debug "无法获取 $package 的安装信息"
+    elif echo "$installed" | grep -qE "$check_str"; then
+      [ -n "$cmd" ] && run ok "$cmd" "安装 $package"
     else
-      log_debug "软件包 ${package} 已安装，跳过"
+      log_debug "$package 已安装"
     fi
   done
+}
+
+##################################################################################################
+# 函数名：runtime
+# 功能：计算并格式化输出脚本运行耗时；依赖全局变量 start_time（脚本起始时间戳，秒）
+# 全局变量: start_time
+# 参数说明: 无入参
+# 返回值: 无返回值，直接控制台打印格式化后的耗时字符串
+# 依赖：date
+##################################################################################################
+runtime() {
+  # 获取脚本结束执行的时间戳（精确到秒）
+  end_time=$(date +%s)
+  # 计算脚本执行时长（秒）
+  duration_sec=$((end_time - start_time))
+  # 计算天数、小时数、分钟数和秒数
+  days=$((duration_sec / 86400))
+  hours=$((duration_sec % 86400 / 3600))
+  minutes=$((duration_sec % 3600 / 60))
+  seconds=$((duration_sec % 60))
+  # 根据时长选择输出格式，并添加秒之后的单位
+  if [ $duration_sec -ge 31536000 ]; then
+    years=$((duration_sec / 31536000))
+    echo "消耗时间：$years 年 $((duration_sec % 31536000 / 86400)) 天 $hours 小时 $minutes 分钟 $seconds 秒"
+  elif [ $duration_sec -ge 86400 ]; then
+    echo "消耗时间：$days 天 $hours 小时 $minutes 分钟 $seconds 秒"
+  elif [ $duration_sec -ge 3600 ]; then
+    echo "消耗时间：$hours 小时 $minutes 分钟 $seconds 秒"
+  elif [ $duration_sec -ge 60 ]; then
+    echo "消耗时间：$minutes 分钟 $seconds 秒"
+  else
+    echo "消耗时间：$seconds 秒"
+  fi
+}
+
+##################################################################################################
+# 函数名：phase
+# 功能：输出安装阶段进度条，带彩色方块标记；支持普通阶段输出与完成(done)收尾输出
+# 全局变量: GREEN YELLOW CYAN NORMAL phases_total(可选，总阶段数，默认3)
+# 参数说明: $1=阶段描述文本；$2=当前阶段序号
+# 返回值: 无返回值，控制台输出彩色进度，同时写入调试日志
+# 依赖：printf、seq、log_debug
+##################################################################################################
+phase() {
+  phases_total="${phases_total:-3}"
+  phase_description="$1"
+  phase_number="$2"
+  if [ "$phase_description" = "done" ]; then
+    # 打印已完成阶段（绿色）
+    printf "${GREEN}"
+    for i in $(seq 1 "$phases_total"); do
+      printf "▣"
+    done
+    printf "${NORMAL} 清理\n"
+  else
+    # 打印已完成阶段（绿色）
+    printf "${GREEN}"
+    for i in $(seq 1 $((phase_number - 1))); do
+      printf "▣"
+    done
+    # 打印当前阶段（黄色）
+    printf "${YELLOW}▣"
+    # 打印剩余阶段（青色）
+    for i in $(seq $((phase_number + 1)) "$phases_total"); do
+      printf "${CYAN}◻"
+    done
+    log_debug "第 ${phase_number} 阶段，共 ${phases_total} 阶段: ${phase_description}"
+    printf "${NORMAL} 第 ${YELLOW}${phase_number}${NORMAL} 阶段，共 ${GREEN}${phases_total}${NORMAL} 阶段: ${phase_description}\n"
+  fi
 }

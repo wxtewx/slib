@@ -678,12 +678,12 @@ task() {
     printf "%s" "$input_prompt"
     ;;
   error)
-    input_prompt="\\n${YELLOW}请输入数字 ${CYAN}[1]${YELLOW} 到 ${CYAN}[$Index]${YELLOW}:${NORMAL} "
-    printf "%s" "$input_prompt"
+    input_prompt="${YELLOW}请输入数字 ${CYAN}[1]${YELLOW} 到 ${CYAN}[$Index]${YELLOW}:${NORMAL} "
+    printf "\n%s" "$input_prompt"
     ;;
   domain_erro)
-    input_prompt="\\n${YELLOW}请输入域名 (例子: www.abc.com):${NORMAL} "
-    printf "%s" "$input_prompt"
+    input_prompt="${YELLOW}请输入域名 (例子: www.abc.com):${NORMAL} "
+    printf "\n%s" "$input_prompt"
     ;;
   secret)
     prompt="${GREEN}${2}:${NORMAL} "

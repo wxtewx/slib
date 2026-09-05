@@ -2,7 +2,6 @@
 # shellcheck disable=SC3043 disable=SC2086 disable=SC2059 disable=SC2039 disable=SC2034 disable=SC2154
 
 underline="________________________________________________________________"
-script_path=$(realpath "$0")
 
 ##################################################################################################
 # 函数名：restore_cursor

@@ -671,75 +671,173 @@ ComputingColumn() {
 task() {
   charcount='0'
   reply=''
+  input_prompt=""
   case $1 in
-  enter) printf "%s" "${GREEN}""$prompt" "${CYAN}"[1"${YELLOW}"-"${CYAN}""$Index"]"${YELLOW}":"${NORMAL}" ;;
-  error) printf "%s\\n${YELLOW}请输入数字 ${CYAN}[1]${YELLOW} 到 ${CYAN}[$Index]${YELLOW}:${NORMAL} " ;;
-  domain_erro) printf "%s\\n${YELLOW}请输入域名 (例子: www.abc.com):${NORMAL} " ;;
+  enter)
+    input_prompt="${GREEN}${prompt} ${CYAN}[1${YELLOW}-${CYAN}${Index}]${YELLOW}:${NORMAL}"
+    printf "%s" "$input_prompt"
+    ;;
+  error)
+    input_prompt="\\n${YELLOW}请输入数字 ${CYAN}[1]${YELLOW} 到 ${CYAN}[$Index]${YELLOW}:${NORMAL} "
+    printf "%s" "$input_prompt"
+    ;;
+  domain_erro)
+    input_prompt="\\n${YELLOW}请输入域名 (例子: www.abc.com):${NORMAL} "
+    printf "%s" "$input_prompt"
+    ;;
   secret)
     prompt="${GREEN}${2}:${NORMAL} "
-    printf "%s$prompt"
+    input_prompt="$prompt"
+    printf "%s$input_prompt"
     ;;
   info)
     issue="${GREEN}${2}:${NORMAL} "
-    printf "%s$issue"
+    input_prompt="$issue"
+    printf "%s$input_prompt"
     ;;
   esac
+
+  cur_pos=$charcount
+
   while :; do
     char=$(
       stty cbreak -echo
       dd if=/dev/tty bs=1 count=1 2>/dev/null
       stty -cbreak echo
     )
-    case $char in
-    #检测空字符 NULL
-    "$(printenv '\000')")
+
+    if [ "$char" = "$(printf '\0')" ]; then
       break
-      ;;
-    #检测退格符
-    "$(printf '\b')")
-      if [ $charcount -gt 0 ]; then
+    fi
+
+    case $char in
+    "$(printf '\b')" | "$(printf '\177')")
+      if [ $cur_pos -gt 0 ]; then
         printf '\b \b'
-        reply="${reply%?}"
+        if [ "$cur_pos" -eq 1 ]; then
+          head=""
+        else
+          head=$(printf "%s" "$reply" | cut -c 1-$((cur_pos - 1)))
+        fi
+        tail=$(printf "%s" "$reply" | cut -c $((cur_pos + 1))-)
+        reply="${head}${tail}"
         charcount=$((charcount - 1))
-      else
-        printf ''
+        cur_pos=$((cur_pos - 1))
+
+        printf '\r'
+        case $1 in
+        secret)
+          printf "%s" "$input_prompt"
+          i=0
+          while [ $i -lt $charcount ]; do
+            printf '*'
+            i=$((i + 1))
+          done
+          ;;
+        *)
+          printf "%s%s" "$input_prompt" "$reply"
+          ;;
+        esac
+        printf '\033[K'
+        j=$charcount
+        while [ $j -gt $cur_pos ]; do
+          printf '\033[D'
+          j=$((j - 1))
+        done
       fi
       ;;
+
     "$(printf '\033')")
-      mode=$(
-        stty cbreak -echo
-        dd if=/dev/tty bs=4 count=1 2>/dev/null
-        stty -cbreak echo
-      )
-      case $mode in
-      '[A' | '[D')
-        printf '\b'
+      esc_buf=""
+      while :; do
+        c=$(
+          stty cbreak -echo
+          dd if=/dev/tty bs=1 count=1 2>/dev/null
+          stty -cbreak echo
+        )
+        esc_buf="${esc_buf}${c}"
+        case "$c" in
+        '[' | 0* | 1* | 2* | 3* | 4* | 5* | 6* | 7* | 8* | 9* | '~') continue ;;
+        *) break ;;
+        esac
+      done
+
+      case "$esc_buf" in
+      '[A' | '[B') ;;
+      '[D')
+        if [ $cur_pos -gt 0 ]; then
+          printf '\033[D'
+          cur_pos=$((cur_pos - 1))
+        fi
         ;;
-      '[B' | '[C')
-        printf '\033[C'
+      '[C')
+        if [ $cur_pos -lt $charcount ]; then
+          printf '\033[C'
+          cur_pos=$((cur_pos + 1))
+        fi
         ;;
       '[3~')
-        if [ $charcount -gt 0 ]; then
-          printf '\033[3~ \033[3~'
-          reply="${reply%?}"
+        if [ $cur_pos -lt $charcount ]; then
+          if [ "$cur_pos" -eq 0 ]; then
+            head=""
+          else
+            head=$(printf "%s" "$reply" | cut -c 1-"$cur_pos")
+          fi
+          tail=$(printf "%s" "$reply" | cut -c $((cur_pos + 1))-)
+          reply="${head}${tail}"
           charcount=$((charcount - 1))
-        else
-          printf ''
+
+          printf '\r'
+          case $1 in
+          secret)
+            printf "%s" "$input_prompt"
+            i=0
+            while [ $i -lt $charcount ]; do
+              printf '*'
+              i=$((i + 1))
+            done
+            ;;
+          *)
+            printf "%s%s" "$input_prompt" "$reply"
+            ;;
+          esac
+          printf '\033[K'
+          j=$charcount
+          while [ $j -gt $cur_pos ]; do
+            printf '\033[D'
+            j=$((j - 1))
+          done
         fi
         ;;
       esac
       ;;
+
     *)
+      if [ "$cur_pos" -eq 0 ]; then
+        head=""
+      else
+        head=$(printf "%s" "$reply" | cut -c 1-"$cur_pos")
+      fi
+      tail=$(printf "%s" "$reply" | cut -c $((cur_pos + 1))-)
+      reply="${head}${char}${tail}"
+      charcount=$((charcount + 1))
+
+      printf '\r'
       case $1 in
       secret)
-        printf '*'
+        printf "%s" "$input_prompt"
+        i=0
+        while [ $i -lt $charcount ]; do
+          printf '*'
+          i=$((i + 1))
+        done
         ;;
       info | enter | error | domain_erro)
-        printf "%s$char"
+        printf "%s%s" "$input_prompt" "$reply"
         ;;
       esac
-      reply="${reply}${char}"
-      charcount=$((charcount + 1))
+      printf '\033[K'
+      cur_pos=$((cur_pos + 1))
       ;;
     esac
   done

@@ -1740,7 +1740,7 @@ MainMenu() {
     ComputingColumn
     Index=$((Index + 1))
     val=$((Index % val_number))
-    printf "${NORMAL}\t(%1d) %-${COL}s${NORMAL}" "${Index}" "${msg}"
+    printf "${NORMAL}(%1d) %-${COL}s${NORMAL}" "${Index}" "${msg}"
     if [ ${val} -eq 0 ]; then
       printf "\n"
     fi

@@ -661,68 +661,405 @@ ComputingColumn() {
 }
 
 ##################################################################################################
-# 函数名：task
-# 功能：终端交互式行输入，原生实现普通文本、密码星号隐藏输入；支持退格、Delete、左右方向键，
-#       光标中间插入/删除；过滤上下方向键；结果存入全局变量 reply。
-# 全局变量：GREEN、CYAN、YELLOW、NORMAL(颜色)；prompt、Index(界面)；reply(输出)
+# 函数名：clear_menu
+# 功能：清除终端菜单输出区域；向上移动光标并逐行擦除菜单内容，不破坏菜单上方已有输出
 # 参数：
-#   $1 模式
-#       enter        常规输入，携带 prompt+Index 序号提示符
-#       error        数字选择重输提示
-#       domain_erro  域名输入提示
-#       secret       密码输入，屏幕显示*，明文存reply
-#       info         普通提示输入
-#   $2  提示文本：secret/info模式有效，其余模式忽略
-# 返回：全局变量 reply 保存输入字符串，无函数return
-# 退出：读取NUL(\0，回车)结束输入
-# 依赖：stty、dd；直接读写/dev/tty，不受管道重定向影响
+#   $1 menu_height：需要清除的菜单行数
+# 返回：无返回值，直接操作终端(tput)
+# 依赖：tput；终端能力支持cuu1(光标上移)、el(擦除行)
+##################################################################################################
+clear_menu() {
+  local menu_height="$1"
+  local i=0
+  while [ $i -lt "$menu_height" ]; do
+    tput cuu1 2>/dev/null
+    tput el 2>/dev/null
+    i=$((i + 1))
+  done
+}
+
+##################################################################################################
+# 函数名：trim
+# 功能：去除字符串首尾空白字符(空格、制表符等[:space:]集合)；保留字符串内部空白
+# 参数：
+#   $* 待处理原始字符串
+# 返回：输出修剪完毕后的字符串，标准输出返回结果
+# 备注：纯shell字符串替换实现，不调用外部工具；兼容sh/dash/bash
+##################################################################################################
+trim() {
+  local var="$*"
+  # 删除前导空白
+  var="${var#"${var%%[![:space:]]*}"}"
+  # 删除尾随空白
+  var="${var%"${var##*[![:space:]]}"}"
+  printf "%s" "$var"
+}
+
+##################################################################################################
+# 函数名：task
+# 功能：终端交互式组件，原生实现行文本输入、密码星号隐藏输入；
+#       文本输入支持：Backspace(退格删除光标左侧)、Delete(删除光标右侧)、←→左右方向键；
+#       支持光标中间位置插入/删除字符；输入模式过滤上下方向键；
+#       内置两种选择菜单模式：
+#         1. select_updown：竖向列表，↑↓方向键单选菜单
+#         2. select：横向单行，←→方向键 / A/D快捷键单选菜单
+#       交互结束结果存入全局变量 reply。
+#
+# 全局变量契约（调用前必须预先定义）：
+#   颜色常量：GREEN、CYAN、YELLOW、DIM、BOLD、NORMAL
+#   enter模式专用：prompt(提示文本)、Index(数字上限)
+#   输出结果：reply，函数执行完成后读取该变量获取返回值
+#
+# 参数说明：
+#   $1 交互模式
+#       enter           常规输入，携带 prompt+Index 序号提示符
+#       error           数字选择重输提示（输入非法后复用）
+#       domain_erro     域名格式错误重输提示
+#       secret          密码输入，屏幕显示*掩码，明文原始值存入reply
+#       info            普通自定义提示文本输入
+#       select_updown   上下箭头竖向选择菜单
+#                           $2=ui_mode(keep/clear/fullclear)
+#                           $3=菜单标题
+#                           $4=选项字符串，多个选项使用 | 竖线分隔
+#                           兼容旧调用：省略ui_mode，直接传标题、选项，自动使用keep模式
+#       select          横向单行单选菜单
+#                           $2=菜单标题
+#                           $3=选项字符串，多个选项使用 | 竖线分隔
+#                           快捷键：A/a 向左切换，D/d 向右切换
+#
+#   $2  提示/标题：secret/info模式为输入提示文本；select/select_updown为菜单标题
+#   $3  菜单模式：选项字符串，多个选项使用 | 竖线分隔
+#   $4  select_updown专用：ui_mode
+#           keep        退出后保留全部菜单输出到终端
+#           clear       调用外部clear_menu清除菜单占用行数
+#           fullclear   调用系统clear整体清屏后渲染菜单
+#
+# 返回：无函数return返回值，交互结果保存在全局变量 reply
+# 结束条件：读取NUL(\0，终端回车键)退出交互循环
+#
+# 外部依赖：
+#   系统工具：stty、dd、awk、cut、tput；直接读写 /dev/tty，不受stdout/stdin管道重定向影响
+#   外部自定义函数：trim() 字符串去首尾空白；clear_menu() 清除N行菜单残留
+#
+# 按键映射：
+#   Enter(回车)     \0(NUL)         确认、结束交互
+#   Backspace       \b / \177       删除光标左侧字符
+#   Delete          \033[3~         删除光标右侧字符
+#   ↑               \033[A          select_updown菜单上移；文本输入模式忽略
+#   ↓               \033[B          select_updown菜单下移；文本输入模式忽略
+#   ←               \033[D          光标左移 / select横向菜单向左选择
+#   →               \033[C          光标右移 / select横向菜单向右选择
+#   A/a、D/d                        select横向菜单快捷键切换
+#
+#  已知限制与注意事项：
+#   1. 菜单项内容**不能包含竖线 |**，会被当作选项分隔符；
+#   2. 不支持多字节中文光标精确定位，中文会造成光标偏移错位；
+#   3. stty修改终端属性，函数内部成对恢复；脚本异常中断会造成终端异常，建议脚本增加trap捕获信号恢复终端；
+#   4. 只支持单行输入，不支持换行；
+#   5. reply、charcount、sel_index等为函数作用域全局变量，多次调用task会覆盖，需要及时读取reply；
+#   6. 不支持Home、End、PageUp/PageDown等扩展按键。
+#
+# 简单调用示例：
+#   task info "请输入名称"
+#   echo "输入结果：$reply"
+#
+#   task select_updown keep "请选择环境" "prod|test|dev"
+#   echo "选中：$reply"
+#
+#   task select "选择协议" "http|https"
+#   echo "选中：$reply"
 ##################################################################################################
 task() {
-  charcount='0'
-  reply=''
-  input_prompt=""
+  # 全局状态变量
+  charcount=0     # 当前输入字符串字符总长度
+  reply=''        # 输出结果，函数执行完成后读取此变量拿到返回值
+  input_prompt="" # 输入提示符文本（带颜色转义码）
+  sel_title=""    # select / select_updown 菜单标题
+  sel_items=""    # select / select_updown 菜单项，格式：item1|item2|item3
+  sel_index=0     # 当前选中项下标，从0开始
+  sel_count=0     # 菜单项总数量
+  ui_mode=""      # select_updown 渲染模式：keep / clear / fullclear
+
+  # read_esc_seq：读取ESC开头的ANSI转义序列（方向键、Home/End/Delete等）
+  # 方向键按下会输出类似 \033[A \033[B 这类序列
+  # 读取直到终止字符 A/B/C/D/~ 停止，返回完整转义字符串
+  read_esc_seq() {
+    local esc_buf=""
+    local c
+    while :; do
+      c=$(dd if=/dev/tty bs=1 count=1 2>/dev/null)
+      esc_buf="${esc_buf}${c}"
+      # ANSI方向键序列结束标记
+      case "$c" in
+      '~' | 'A' | 'B' | 'C' | 'D')
+        break
+        ;;
+      esac
+    done
+    printf "%s" "$esc_buf"
+  }
+
+  # 根据第一个参数区分交互模式
   case $1 in
+  # enter：普通文本输入模式，带 [1‑Index] 格式提示符
   enter)
     input_prompt="${GREEN}${prompt} ${CYAN}[1${YELLOW}-${CYAN}${Index}]${YELLOW}:${NORMAL}"
     printf "%s" "$input_prompt"
     ;;
+  # error：输入非法后的重新输入提示（数字范围提示）
   error)
     input_prompt="${YELLOW}请输入数字 ${CYAN}[1]${YELLOW} 到 ${CYAN}[$Index]${YELLOW}:${NORMAL} "
     printf "\n%s" "$input_prompt"
     ;;
+  # domain_erro：域名格式错误后的重新输入提示
   domain_erro)
     input_prompt="${YELLOW}请输入域名 (例子: www.abc.com):${NORMAL} "
     printf "\n%s" "$input_prompt"
     ;;
+  # secret：密码输入模式，输入内容屏幕显示为 * 星号，第二个参数为提示文本
   secret)
     prompt="${GREEN}${2}:${NORMAL} "
     input_prompt="$prompt"
     printf "%s$input_prompt"
     ;;
+  # info：普通信息提示输入，第二个参数为提示文本
   info)
     issue="${GREEN}${2}:${NORMAL} "
     input_prompt="$issue"
     printf "%s$input_prompt"
     ;;
+  # select_updown：上下箭头竖向选择菜单
+  # 参数：task select_updown [ui_mode] "标题" "选项1|选项2|选项3"
+  # ui_mode：keep(保留菜单输出) / clear(清除菜单行) / fullclear(调用系统clear清屏)
+  # 兼容旧调用：不传ui_mode时自动回退 keep 模式
+  select_updown)
+    ui_mode="$2"
+    sel_title="$3"
+    sel_items="$4"
+    # 兼容旧调用：第二个参数不是模式关键字，回退旧参数位置
+    case "$ui_mode" in
+    keep | clear | fullclear) ;;
+    *)
+      ui_mode="keep"
+      sel_title="$2"
+      sel_items="$3"
+      ;;
+    esac
+    # 按 | 分割，计算菜单项总数
+    sel_count=$(printf "%s" "$sel_items" | awk -F'|' '{print NF}')
+    ;;
+  # select：横向单选菜单，左右方向键切换，a/d键也可以切换选项
+  # task select "标题" "选项1|选项2|选项3"
+  select)
+    sel_title="$2"
+    sel_items="$3"
+    sel_index=0
+    sel_count=$(printf "%s" "$sel_items" | awk -F'|' '{print NF}')
+    ;;
   esac
 
-  cur_pos=$charcount
+  cur_pos=$charcount # 输入模式下光标当前逻辑位置（字符偏移，0开头）
 
+  ###########################################################################
+  # select_updown：竖向列表选择菜单，↑↓方向键移动，回车确认（\0 空字符代表回车）
+  # tput sc 保存光标位置；tput rc 恢复光标位置，实现原地刷新重绘菜单
+  # tput civis 隐藏光标；tput cnorm 恢复光标显示
+  ###########################################################################
+  if [ "$1" = "select_updown" ]; then
+    # fullclear：执行系统clear完全清屏
+    if [ "$ui_mode" = "fullclear" ]; then
+      clear 2>/dev/null
+    fi
+    printf "\n%s\n" "${GREEN}${sel_title}${NORMAL}"
+    tput sc 2>/dev/null
+    tput civis 2>/dev/null
+
+    while :; do
+      tput rc 2>/dev/null # 恢复到保存的光标位置，原地重绘菜单
+      i=0
+      while [ $i -lt "$sel_count" ]; do
+        printf "\033[2K" # \033[2K：清除整行
+        raw_item=$(printf "%s" "$sel_items" | cut -d'|' -f$((i + 1)))
+        item=$(trim "$raw_item")
+        if [ $i -eq "$sel_index" ]; then
+          printf "${CYAN}➤${NORMAL} %s" "$item"
+        else
+          printf "  %s" "$item"
+        fi
+        printf "\n"
+        i=$((i + 1))
+      done
+
+      # stty cbreak -echo：单字符读取，不等待回车，不回显输入
+      char=$(
+        stty cbreak -echo
+        dd if=/dev/tty bs=1 count=1 2>/dev/null
+        stty -cbreak echo
+      )
+
+      # \0 空字符 = 回车键，确认选择，把选中项写入 reply，退出循环
+      if [ "$char" = "$(printf '\0')" ]; then
+        raw_reply=$(printf "%s" "$sel_items" | cut -d'|' -f$((sel_index + 1)))
+        reply=$(trim "$raw_reply")
+        break
+      fi
+
+      case "$char" in
+      "$(printf '\033')")
+        esc_buf=$(read_esc_seq)
+        case "$esc_buf" in
+        '[A')
+          if [ $sel_index -gt 0 ]; then
+            sel_index=$((sel_index - 1))
+          fi
+          ;;
+        '[B')
+          if [ $sel_index -lt $((sel_count - 1)) ]; then
+            sel_index=$((sel_index + 1))
+          fi
+          ;;
+        esac
+        ;;
+      esac
+    done
+
+    # 根据ui_mode处理退出之后屏幕残留
+    case "$ui_mode" in
+    keep)
+      tput cnorm 2>/dev/null
+      printf "\n"
+      ;;
+    clear | fullclear)
+      clear_menu "$sel_count" # 外部函数：清除菜单占用的N行
+      tput cnorm 2>/dev/null
+      ;;
+    *)
+      tput cnorm 2>/dev/null
+      printf "\n"
+      ;;
+    esac
+    return 0
+  fi
+
+  ###########################################################################
+  # select：横向单选菜单，左右方向键 / A D键切换选项，回车确认
+  # 在同一行原地刷新渲染选项，○未选中，●选中
+  ###########################################################################
+  if [ "$1" = "select" ]; then
+    printf "\n%s\n" "${GREEN}${sel_title}${NORMAL}"
+    tput sc 2>/dev/null
+    tput civis 2>/dev/null
+    while :; do
+      tput rc 2>/dev/null
+      printf "\r\033[K" # \r回到行首，\033[K清除光标到行尾
+      i=0
+      line_out=""
+      while [ $i -lt "$sel_count" ]; do
+        raw_item=$(printf "%s" "$sel_items" | cut -d'|' -f$((i + 1)))
+        item=$(trim "$raw_item")
+        if [ $i -eq "$sel_index" ]; then
+          line_out="${line_out}${CYAN}●${NORMAL} ${item}"
+        else
+          line_out="${line_out}${DIM}○${NORMAL} ${item}"
+        fi
+        if [ $i -lt $((sel_count - 1)) ]; then
+          line_out="${line_out}  /  "
+        fi
+        i=$((i + 1))
+      done
+      printf "%s" "$line_out"
+
+      # 单字符无回显读取按键
+      char=$(
+        stty cbreak -echo
+        dd if=/dev/tty bs=1 count=1 2>/dev/null
+        stty -cbreak echo
+      )
+
+      # 回车键确认选择
+      if [ "$char" = "$(printf '\0')" ]; then
+        raw_reply=$(printf "%s" "$sel_items" | cut -d'|' -f$((sel_index + 1)))
+        reply=$(trim "$raw_reply")
+        break
+      fi
+
+      case "$char" in
+      "$(printf '\033')")
+        esc_buf=$(read_esc_seq)
+        case "$esc_buf" in
+        '[D')
+          if [ $sel_index -gt 0 ]; then
+            sel_index=$((sel_index - 1))
+          fi
+          ;;
+        '[C')
+          if [ $sel_index -lt $((sel_count - 1)) ]; then
+            sel_index=$((sel_index + 1))
+          fi
+          ;;
+        esac
+        ;;
+      'a' | 'A')
+        if [ $sel_index -gt 0 ]; then
+          sel_index=$((sel_index - 1))
+        fi
+        ;;
+      'd' | 'D')
+        if [ $sel_index -lt $((sel_count - 1)) ]; then
+          sel_index=$((sel_index + 1))
+        fi
+        ;;
+      esac
+    done
+
+    # 退出循环，打印最终选中结果行
+    tput rc 2>/dev/null
+    printf "\r\033[K"
+    i=0
+    final_out=""
+    while [ $i -lt "$sel_count" ]; do
+      raw_item=$(printf "%s" "$sel_items" | cut -d'|' -f$((i + 1)))
+      item=$(trim "$raw_item")
+      if [ $i -eq "$sel_index" ]; then
+        final_out="${final_out}${GREEN}●${NORMAL} ${BOLD}${item}${NORMAL}"
+      else
+        final_out="${final_out}${DIM}○${NORMAL} ${item}"
+      fi
+      if [ $i -lt $((sel_count - 1)) ]; then
+        final_out="${final_out}  /  "
+      fi
+      i=$((i + 1))
+    done
+    printf "%s\n" "$final_out"
+    tput cnorm 2>/dev/null
+    return 0
+  fi
+
+  ###########################################################################
+  # enter / secret / info / error / domain_erro：文本输入编辑器
+  # 支持：普通字符输入、退格、Delete删除、←→方向键移动光标
+  # secret模式回显星号；其余模式回显真实输入；回车(\0)结束输入
+  # reply保存输入字符串；cur_pos记录光标逻辑位置；charcount总字符数
+  ###########################################################################
   while :; do
+    # 单字符读取终端按键
     char=$(
       stty cbreak -echo
       dd if=/dev/tty bs=1 count=1 2>/dev/null
       stty -cbreak echo
     )
 
+    # \0 = 回车键，结束输入循环
     if [ "$char" = "$(printf '\0')" ]; then
       break
     fi
 
-    case $char in
+    case "$char" in
+    # Backspace退格键：\b 或 \177(DEL，不同终端退格码不一样)
     "$(printf '\b')" | "$(printf '\177')")
       if [ $cur_pos -gt 0 ]; then
         printf '\b \b'
+        # head：光标前面内容；tail：光标后面内容；删掉光标前一个字符
         if [ "$cur_pos" -eq 1 ]; then
           head=""
         else
@@ -733,6 +1070,7 @@ task() {
         charcount=$((charcount - 1))
         cur_pos=$((cur_pos - 1))
 
+        # 重绘整行提示符+输入内容
         printf '\r'
         case $1 in
         secret)
@@ -748,6 +1086,7 @@ task() {
           ;;
         esac
         printf '\033[K'
+        # 移动光标回到逻辑cur_pos位置
         j=$charcount
         while [ $j -gt $cur_pos ]; do
           printf '\033[D'
@@ -756,23 +1095,11 @@ task() {
       fi
       ;;
 
+    # ESC转义序列处理：方向键、Delete键
     "$(printf '\033')")
-      esc_buf=""
-      while :; do
-        c=$(
-          stty cbreak -echo
-          dd if=/dev/tty bs=1 count=1 2>/dev/null
-          stty -cbreak echo
-        )
-        esc_buf="${esc_buf}${c}"
-        case "$c" in
-        '[' | 0* | 1* | 2* | 3* | 4* | 5* | 6* | 7* | 8* | 9* | '~') continue ;;
-        *) break ;;
-        esac
-      done
-
+      esc_buf=$(read_esc_seq)
       case "$esc_buf" in
-      '[A' | '[B') ;;
+      '[A' | '[B') ;; # ↑↓上下方向键，输入模式忽略
       '[D')
         if [ $cur_pos -gt 0 ]; then
           printf '\033[D'
@@ -787,15 +1114,13 @@ task() {
         ;;
       '[3~')
         if [ $cur_pos -lt $charcount ]; then
-          if [ "$cur_pos" -eq 0 ]; then
-            head=""
-          else
-            head=$(printf "%s" "$reply" | cut -c 1-"$cur_pos")
-          fi
-          tail=$(printf "%s" "$reply" | cut -c $((cur_pos + 1))-)
+          # head：光标前；tail：跳过光标当前字符，取后面全部
+          head=$(printf "%s" "$reply" | cut -c 1-"$cur_pos")
+          tail=$(printf "%s" "$reply" | cut -c $((cur_pos + 2))-)
           reply="${head}${tail}"
           charcount=$((charcount - 1))
 
+          # 重绘输入行
           printf '\r'
           case $1 in
           secret)
@@ -811,6 +1136,7 @@ task() {
             ;;
           esac
           printf '\033[K'
+          # 光标恢复到原来逻辑位置
           j=$charcount
           while [ $j -gt $cur_pos ]; do
             printf '\033[D'
@@ -821,6 +1147,7 @@ task() {
       esac
       ;;
 
+    # 普通可打印字符输入：在光标位置插入字符
     *)
       if [ "$cur_pos" -eq 0 ]; then
         head=""
@@ -831,6 +1158,7 @@ task() {
       reply="${head}${char}${tail}"
       charcount=$((charcount + 1))
 
+      # 重绘行
       printf '\r'
       case $1 in
       secret)
@@ -847,6 +1175,12 @@ task() {
       esac
       printf '\033[K'
       cur_pos=$((cur_pos + 1))
+      # 光标移动到逻辑位置
+      j=$charcount
+      while [ $j -gt $cur_pos ]; do
+        printf '\033[D'
+        j=$((j - 1))
+      done
       ;;
     esac
   done

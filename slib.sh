@@ -1457,6 +1457,9 @@ task() {
 yesno() {
   # XXX skipyesno 是由调用脚本设置的全局变量
   # shellcheck disable=SC2154
+  if [ "$force_no" = "1" ]; then
+    return 0
+  fi
   if [ "$skipyesno" = "1" ]; then
     return 0
   fi
@@ -1511,12 +1514,12 @@ task_select_yesno() {
   task select "$prompt" "是|否"
   case "${reply}" in
   "是")
-    local skipyesno=1
-    local force_no=0
+    skipyesno=1
+    force_no=0
     ;;
   "否")
-    local skipyesno=0
-    local force_no=1
+    skipyesno=0
+    force_no=1
     ;;
   esac
 

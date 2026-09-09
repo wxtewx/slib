@@ -724,25 +724,6 @@ trim() {
 ESC=$(printf '\033')
 
 ##################################################################################################
-# 函数名：checkwinsize
-# 功能：简单判断项目数量是否超出可用行数；用于菜单窗口大小预校验
-# 参数：
-#   $1 __items 项目总数
-#   $2 __lines 终端可用行数
-# 返回：0=项目数小于行数；1=项目数大于等于行数
-# 备注：仅逻辑比较，不调用tput获取真实终端尺寸；兼容sh/dash/bash
-##################################################################################################
-checkwinsize() {
-  __items="$1"
-  __lines="$2"
-  if [ "$__items" -ge "$__lines" ]; then
-    return 1
-  else
-    return 0
-  fi
-}
-
-##################################################################################################
 # 函数名：read_char
 # 功能：从/dev/tty读取单个原始字节，用于终端按键捕获；不缓冲、不回显
 # 参数：无
@@ -774,72 +755,74 @@ read_esc_seq() {
 
 ##################################################################################################
 # 函数名：key_input
-# 功能：读取终端按键，解析为语义token；输出两行：第一行为token，第二行为原始字节
+# 功能：读取终端按键，解析为语义 token；输出两行：第一行为 token，第二行为原始字节
 # 参数：无
+# 依赖变量：
+#   CURR_INPUT_MODE：当前交互模式，可选 select_updown / select / multiselect
+#   ESC：ESC转义起始字符 (\033)
+# 依赖函数：
+#   read_char：从终端读取单个原始字符
+#   read_esc_seq：读取 ESC 之后的 ANSI 转义序列剩余字符
 # 返回：stdout第1行：enter/space/up/down/left/right/all/none/delete；第2行原始按键字节
-# 备注：支持字母j/k/h/l快捷键；支持ESC方向键、Delete；读取/dev/tty；兼容sh/dash/bash
+# 备注：
+#   1. 支持 Vim 格字母快捷键 j/k/h/l；支持 ANSI ESC 方向键、Delete 功能键
+#   2. 回车(\r)、换行(\n)统一识别为 enter
+#   3. 输出第2段原始字节**不带末尾换行**，保留按键原始序列
+#   4. 兼容 sh / dash / bash，底层读取 /dev/tty
+#   5. 未知按键/无法识别的转义序列，token 固定返回 none
 ##################################################################################################
 key_input() {
-  ch=""
-  ch=$(read_char)
-  if [ "$ch" = "$(printf '\015')" ] || [ "$ch" = "$(printf '\012')" ]; then
-    printf "%s\n" "enter"
-    printf "%s" "$ch"
-    return
-  fi
-  if [ "$ch" = " " ]; then
-    printf "%s\n" "space"
-    printf "%s" "$ch"
-    return
-  fi
-  case "$ch" in
-  k | K)
-    printf "%s\n" "up"
-    printf "%s" "$ch"
-    return
-    ;;
-  j | J)
-    printf "%s\n" "down"
-    printf "%s" "$ch"
-    return
-    ;;
-  h | H)
-    printf "%s\n" "left"
-    printf "%s" "$ch"
-    return
-    ;;
-  l | L)
-    printf "%s\n" "right"
-    printf "%s" "$ch"
-    return
-    ;;
-  a | A)
-    printf "%s\n" "all"
-    printf "%s" "$ch"
-    return
-    ;;
-  n | N)
-    printf "%s\n" "none"
-    printf "%s" "$ch"
-    return
-    ;;
-  esac
-  if [ "$ch" = "$ESC" ]; then
-    esc_seq=$(read_esc_seq)
-    case "$esc_seq" in
-    '[A') token="up" ;;
-    '[B') token="down" ;;
-    '[C') token="right" ;;
-    '[D') token="left" ;;
-    '[3~') token="delete" ;;
-    *) token="none" ;;
+  local ch=""           # 保存单次读取到的原始字符
+  local key_name="none" # 解析后的按键名称，默认 none（未知按键）
+  local raw_seq=""      # 完整原始按键序列，用于保留原始输入
+  local CR              # 回车字符 \r
+  local LF              # 换行字符 \n
+  CR="$(printf '\r')"
+  LF="$(printf '\n')"
+
+  # 读取单个原始字符
+  ch="$(read_char)"
+  raw_seq="$ch"
+
+  # 回车键判断：\r 或 \n 都识别为 enter
+  if [ "$ch" = "$CR" ] || [ "$ch" = "$LF" ]; then
+    key_name="enter"
+  # 空格键
+  elif [ "$ch" = " " ]; then
+    key_name="space"
+  # 其他字符，按当前模式做Vim风格按键映射
+  else
+    case "$CURR_INPUT_MODE:$ch" in
+    select_updown:[kK]) key_name="up" ;;   # select_updown模式：k/K = 向上
+    select_updown:[jJ]) key_name="down" ;; # select_updown模式：j/J = 向下
+    select:[hH]) key_name="left" ;;        # select模式：h/H = 左
+    select:[lL]) key_name="right" ;;       # select模式：l/L = 右
+    multiselect:[kK]) key_name="up" ;;     # multiselect多选模式：k/K = 向上
+    multiselect:[jJ]) key_name="down" ;;   # multiselect多选模式：j/J = 向下
+    multiselect:[aA]) key_name="all" ;;    # multiselect多选模式：a/A = 全选
+    multiselect:[nN]) key_name="none" ;;   # multiselect多选模式：n/N = 取消全选
+    *)
+      # 捕获ESC开头的ANSI转义序列（方向键、Delete等功能键）
+      if [ "$ch" = "$ESC" ]; then
+        local esc_seq
+        esc_seq="$(read_esc_seq)"
+        raw_seq="${ESC}${esc_seq}" # 拼接完整ESC转义串
+        case "$esc_seq" in
+        '[A') key_name="up" ;;      # ↑ 上方向键
+        '[B') key_name="down" ;;    # ↓ 下方向键
+        '[C') key_name="right" ;;   # → 右方向键
+        '[D') key_name="left" ;;    # ← 左方向键
+        '[3~') key_name="delete" ;; # Delete 删除键
+        *) key_name="none" ;;       # 未识别的 ESC 序列
+        esac
+      fi
+      ;;
     esac
-    printf "%s\n" "$token"
-    printf "%s" "${ESC}${esc_seq}"
-    return
   fi
-  printf "%s\n" "none"
-  printf "%s" "$ch"
+
+  #输出解析结果：第一行按键名，第二行原始按键序列（无换行）
+  printf "%s\n" "$key_name"
+  printf "%s" "$raw_seq"
 }
 
 ##################################################################################################
@@ -1084,6 +1067,8 @@ task() {
       printf "\n"
       i=$((i + 1))
     done
+
+    CURR_INPUT_MODE="select_updown"
     # 隐藏光标，开启cbreak关闭回显，原始终端按键读取
     tput civis 2>/dev/null
     stty cbreak -echo 2>/dev/null
@@ -1152,6 +1137,8 @@ task() {
       fi
       i=$((i + 1))
     done
+
+    CURR_INPUT_MODE="multiselect"
     tput civis 2>/dev/null
     stty cbreak -echo 2>/dev/null
     # 多选交互主循环
@@ -1249,6 +1236,7 @@ task() {
   if [ "$1" = "select" ]; then
     printf "\n"
     menu_total_lines=2
+    CURR_INPUT_MODE="select"
     tput civis 2>/dev/null
     stty cbreak -echo 2>/dev/null
     # 横向菜单交互循环
@@ -2298,18 +2286,30 @@ password() {
 
 ##################################################################################################
 # 函数名：setfr
-# 功能：自动识别防火墙类型（ufw/firewalld），开放指定端口，支持端口/协议格式（如53/tcp、53/udp、53/all）
+# 功能：自动识别防火墙类型（ufw/firewalld），批量放行端口规则；支持端口/tcp/udp/all语法
 # 全局变量: 无
-# 选项说明: 参数支持格式：端口/tcp、端口/udp、端口/all（all代表同时放行tcp+udp），可传入多个
-# 返回值: 无
-# 依赖：log_debug、sudo、ufw、firewall-cmd
+# 参数说明: $@ 端口规则列表，格式示例：80/tcp、53/udp、443/all、22
+# 返回值: 识别不到支持防火墙直接return；正常执行返回0
+# 依赖：log_debug
+# 备注：
+#   1. 探测顺序：ufw > firewalld；不识别则跳过端口配置
+#   2. ufw检测为inactive时自动启用；firewalld规则添加完成后执行reload永久生效
+#   3. 端口语法说明：
+#      - port        默认放行tcp
+#      - port/tcp    放行tcp
+#      - port/udp    放行udp
+#      - port/all    同时放行tcp+udp
+#   4. 先解析端口并合法性校验（端口范围 1~65535），非法端口直接跳过
+#   5. POSIX标准写法，兼容 sh / dash / bash
 ##################################################################################################
 setfr() {
-  local fw_type real_port proto
+  local fw_type
+  # 检测防火墙类型
   if [ -x /usr/sbin/ufw ]; then
     fw_type="ufw"
-    ufwstatus=$(sudo ufw status | awk 'NR==1' | awk -F ': ' '{print $2}')
-    if [ "$ufwstatus" = inactive ]; then
+    # 简化状态提取，单次awk
+    ufwstatus=$(sudo ufw status | awk 'NR==1{print $2}')
+    if [ "$ufwstatus" = "inactive" ]; then
       log_debug "开启 UFW 防火墙"
       echo y | sudo ufw enable >/dev/null 2>&1
     fi
@@ -2317,54 +2317,69 @@ setfr() {
     fw_type="firewalld"
   else
     log_debug "未识别支持的防火墙，跳过端口配置"
-    return
+    return 0
   fi
 
-  # 公共执行函数，无数组
+  # 内部函数：添加单条端口规则
   do_rule() {
-    case $fw_type in
+    local real_port proto
+    real_port="$1"
+    proto="$2"
+    case "$fw_type" in
     ufw)
       log_debug "开始配置 $proto:$real_port 端口"
-      sudo ufw allow "${real_port}/$proto"
+      sudo ufw allow "${real_port}/${proto}"
       log_debug "配置 $proto:$real_port 端口完成"
       ;;
     firewalld)
       log_debug "开始配置 $proto:$real_port 端口"
-      firewall-cmd --zone=public --add-port="${real_port}/$proto" --permanent
+      sudo firewall-cmd --zone=public --add-port="${real_port}/${proto}" --permanent
       log_debug "配置 $proto:$real_port 端口完成"
       ;;
     esac
   }
 
-  for port in "$@"; do
-    case $port in
-    */all)
-      real_port="${port%/all}"
-      proto="tcp"
-      do_rule
-      proto="udp"
-      do_rule
-      ;;
-    */tcp)
-      real_port="${port%/tcp}"
-      proto="tcp"
-      do_rule
-      ;;
-    */udp)
-      real_port="${port%/udp}"
-      proto="udp"
-      do_rule
+  # 遍历所有端口参数
+  local entry real_port proto_suffix
+  for entry in "$@"; do
+    # 分离端口与协议后缀
+    case "$entry" in
+    */all | */tcp | */udp)
+      proto_suffix="${entry##*/}"
+      real_port="${entry%/*}"
       ;;
     *)
-      real_port="$port"
-      proto="tcp"
-      do_rule
+      proto_suffix="tcp"
+      real_port="$entry"
+      ;;
+    esac
+
+    # 【提前统一校验端口】
+    if ! [ "$real_port" -ge 1 ] 2>/dev/null || ! [ "$real_port" -le 65535 ]; then
+      log_debug "setfr: 无效端口号【$real_port】，跳过条目 $entry"
+      continue
+    fi
+
+    # 根据协议后缀执行规则
+    case "$proto_suffix" in
+    all)
+      do_rule "$real_port" "tcp"
+      do_rule "$real_port" "udp"
+      ;;
+    tcp)
+      do_rule "$real_port" "tcp"
+      ;;
+    udp)
+      do_rule "$real_port" "udp"
       ;;
     esac
   done
 
-  case $fw_type in
-  firewalld) firewall-cmd --reload ;;
+  # firewalld 重载生效
+  case "$fw_type" in
+  firewalld)
+    sudo firewall-cmd --reload
+    ;;
   esac
 }
 
@@ -2482,9 +2497,24 @@ tarzip() {
 # 选项说明: 无
 # 返回值: 识别失败直接exit退出，成功导出包管理相关全局变量
 # 依赖：id
+# 备注：
+#   1. 自动判断执行用户身份：root不添加sudo，非root自动添加sudo前缀
+#   2. 包管理器探测优先级：dnf > yum > apt-get，无法识别则终止脚本
+#   3. 使用局部变量pfx统一处理命令前缀，非空时自带尾部空格，简化命令拼接逻辑
+#   4. 变量包含在线/离线安装、卸载、更新、缓存清理、包查询、离线包下载、源配置管理命令
+#   5. POSIX标准写法，兼容 sh / dash / bash
 ##################################################################################################
 init_package_manager() {
-  cmd_prefix=$([ "$(id -u)" -eq 0 ] && echo "" || echo "sudo ")
+  local uid pfx
+  uid=$(id -u)
+  if [ "$uid" -eq 0 ]; then
+    cmd_prefix=""
+  else
+    cmd_prefix="sudo"
+  fi
+  # 前缀：非空时自动追加空格，方便拼接命令
+  pfx="${cmd_prefix:+$cmd_prefix }"
+  # 自动探测包管理器
   if [ -x /usr/bin/dnf ]; then
     pm="dnf"
   elif [ -x /usr/bin/yum ]; then
@@ -2495,35 +2525,33 @@ init_package_manager() {
     printf "${RED}无法识别此操作系统/版本.无法继续.${NORMAL}\n"
     exit 1
   fi
-
   case "$pm" in
   dnf | yum)
     install_cmd="$pm"
-    install="${cmd_prefix} $install_cmd -y install"
-    offline_install="${cmd_prefix} $install_cmd -y install --disablerepo='*' --enablerepo=offline"
-    remove="${cmd_prefix} $install_cmd -y autoremove"
-    upgrade="$install_cmd -y update"
-    update="${cmd_prefix} $install_cmd clean all ; $install_cmd makecache -y"
-    offline_update="${cmd_prefix} $install_cmd clean all ; $install_cmd makecache --disablerepo='*' --enablerepo=offline"
-    offline_info="${cmd_prefix} $install_cmd info --quiet --disablerepo='*' --enablerepo=offline"
-
+    install="${pfx}${install_cmd} -y install"
+    offline_install="${pfx}${install_cmd} -y install --disablerepo='*' --enablerepo=offline"
+    remove="${pfx}${install_cmd} -y autoremove"
+    upgrade="${pfx}${install_cmd} -y update"
+    update="${pfx}${install_cmd} clean all ; ${pfx}${install_cmd} makecache -y"
+    offline_update="${pfx}${install_cmd} clean all ; ${pfx}${install_cmd} makecache --disablerepo='*' --enablerepo=offline"
+    offline_info="${pfx}${install_cmd} info --quiet --disablerepo='*' --enablerepo=offline"
     if [ "$pm" = "dnf" ]; then
-      install_info="${cmd_prefix} $install_cmd info --quiet"
-      offline_down="${cmd_prefix} $install_cmd download --alldeps --resolve --destdir"
-      install_config_manager="${cmd_prefix} $install_cmd config-manager"
+      install_info="${pfx}${install_cmd} info --quiet"
+      offline_down="${pfx}${install_cmd} download --alldeps --resolve --destdir"
+      install_config_manager="${pfx}${install_cmd} config-manager"
     else
-      install_info="${cmd_prefix} $install_cmd info"
-      offline_down="${cmd_prefix} repotrack --download_path"
-      install_config_manager="${cmd_prefix} yum-config-manager"
+      install_info="${pfx}${install_cmd} info"
+      offline_down="${pfx}repotrack --download_path"
+      install_config_manager="${pfx}yum-config-manager"
     fi
     ;;
   apt-get)
     install_cmd=apt-get
-    install="${cmd_prefix} $install_cmd -q -y install"
-    remove="${cmd_prefix} $install_cmd autoremove --assume-yes --purge"
-    update="${cmd_prefix} $install_cmd -y update"
-    install_info="${cmd_prefix} apt-cache policy"
-    offline_down="${cmd_prefix} $install_cmd install -y --download-only"
+    install="${pfx}${install_cmd} -q -y install"
+    remove="${pfx}${install_cmd} autoremove --assume-yes --purge"
+    update="${pfx}${install_cmd} -y update"
+    install_info="${pfx}apt-cache policy"
+    offline_down="${pfx}${install_cmd} install -y --download-only"
     ;;
   esac
 }
@@ -2531,50 +2559,58 @@ init_package_manager() {
 ##################################################################################################
 # 函数名：check_install
 # 功能：批量检查软件包安装状态，未安装则执行安装；支持在线OLI/离线OFI两种模式，兼容apt/dnf/yum包管理器
-# 全局变量: menu install_cmd install_info install offline_info offline_install DEBIAN_FRONTEND
+# 全局变量: menu、install_cmd、install_info、install、offline_info、offline_install
 # 参数说明: $@ 需要检测/安装的软件包列表
 # 返回值: 无返回值；不支持的包管理器直接返回0
 # 依赖：run、log_debug、grep
+# 备注：
+#   1. 局部设置 DEBIAN_FRONTEND="noninteractive"，避免Debian系包管理器弹出交互式确认提示
+#   2. 局部设置 LC_ALL=C LANG=C，强制命令输出英文，消除本地化文本干扰包状态判断
+#   3. 在线模式(OLI)：调用 install_info 查询包状态，使用 install 变量保存的命令执行安装
+#   4. 离线模式(OFI)：调用 offline_info 查询包状态，使用 offline_install 变量保存的命令执行离线安装
+#   5. 状态判断逻辑：
+#      - 查询输出为空：记录调试日志【无法获取包信息】
+#      - 输出匹配 check_str：判定包未安装，调用 run 执行安装命令
+#      - 其余情况：判定包已安装，记录调试日志
+#   6. POSIX 标准写法，兼容 sh / dash / bash 环境
+#   7. 包安装命令仅在检测到缺失时才拼接并执行，避免无条件执行安装操作
+#   8. OFI dnf/yum 分支使用 eval 执行离线查询命令，用于兼容离线场景的命令封装
 ##################################################################################################
 check_install() {
-  DEBIAN_FRONTEND="noninteractive"
-  local package installed cmd
-  # 内部函数：获取检查字符串
-  get_check_str() {
-    case "$1" in
-    apt | apt-get) echo "(none)" ;;
-    dnf | yum) echo "Available Packages" ;;
-    *) echo "" ;;
-    esac
-  }
-  # 获取检查字符串
-  local check_str
-  check_str=$(get_check_str "$install_cmd")
-  [ -z "$check_str" ] && return 0 # 完全不支持的包管理器，直接返回
+  local DEBIAN_FRONTEND="noninteractive"
+  local package installed check_str
+  local LC_ALL=C LANG=C
+  local cmd_prefix=""
+  case "$install_cmd" in
+  apt | apt-get) check_str="(none)" ;;
+  dnf | yum) check_str="Available Packages" ;;
+  *) return 0 ;;
+  esac
   for package in "$@"; do
     installed=""
-    cmd=""
-    # 确定命令
-    case "$menu:$install_cmd" in
+    cmd_prefix=""
+    case "${menu}:${install_cmd}" in
     "OLI:"*)
-      installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
-      cmd="$install $package"
+      installed=$($install_info "${package}" 2>/dev/null)
+      cmd_prefix="$install"
       ;;
     "OFI:dnf" | "OFI:yum")
-      installed=$(LC_ALL=C LANG=C eval "$offline_info \"$package\"" 2>/dev/null)
-      cmd="$offline_install $package"
+      installed=$(eval $offline_info "${package}" 2>/dev/null)
+      cmd_prefix="$offline_install"
       ;;
     "OFI:apt" | "OFI:apt-get")
-      installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
-      cmd="$install $package"
+      installed=$($install_info "${package}" 2>/dev/null)
+      cmd_prefix="$install"
       ;;
     *) continue ;;
     esac
-    # 检查并执行
     if [ -z "$installed" ]; then
       log_debug "无法获取 $package 的安装信息"
-    elif echo "$installed" | grep -qE "$check_str"; then
-      [ -n "$cmd" ] && run ok "$cmd" "安装 $package"
+    elif printf '%s\n' "$installed" | grep -qE "$check_str"; then
+      # 仅在满足条件时现场拼接，不存入中间变量，消除SC2089
+      if [ -n "$cmd_prefix" ]; then
+        run ok "$cmd_prefix $package" "安装 $package"
+      fi
     else
       log_debug "$package 已安装"
     fi
@@ -2583,35 +2619,70 @@ check_install() {
 
 ##################################################################################################
 # 函数名：runtime
-# 功能：计算并格式化输出脚本运行耗时；依赖全局变量 start_time（脚本起始时间戳，秒）
-# 全局变量: start_time
-# 参数说明: 无入参
-# 返回值: 无返回值，直接控制台打印格式化后的耗时字符串
-# 依赖：date
+# 功能：根据预先记录的 start_time_ms 计算脚本运行耗时，格式化输出人类可读时间
+# 参数：无
+# 依赖变量：
+#   start_time_ms：脚本起始毫秒时间戳，需提前 start_time_ms=$(date +%s%3N) 定义
+# 依赖函数：
+#   log_error()：输出ERROR级别日志
+#   log_warning()：输出WARNING级别日志
+# 返回：stdout 打印格式化耗时字符串
+# 备注：
+#   1. Unix时间戳自动处理闰年；只输出非0单位，跳过数值为0的字段
+#   2. 显示规则：时长>=1秒时不展示毫秒；仅当不足1秒才输出毫秒
+#   3. 兼容 sh / dash / bash；依赖 GNU date（Linux，%3N扩展）
+#   4. 年份按365天近似换算，天/时/分/秒由Unix时间戳自动处理闰年
+#   5. 全部输出统一使用 printf，错误告警复用项目已有 log_error / log_warning
 ##################################################################################################
 runtime() {
-  # 获取脚本结束执行的时间戳（精确到秒）
-  end_time=$(date +%s)
-  # 计算脚本执行时长（秒）
-  duration_sec=$((end_time - start_time))
-  # 计算天数、小时数、分钟数和秒数
-  days=$((duration_sec / 86400))
-  hours=$((duration_sec % 86400 / 3600))
-  minutes=$((duration_sec % 3600 / 60))
-  seconds=$((duration_sec % 60))
-  # 根据时长选择输出格式，并添加秒之后的单位
-  if [ $duration_sec -ge 31536000 ]; then
-    years=$((duration_sec / 31536000))
-    echo "消耗时间：$years 年 $((duration_sec % 31536000 / 86400)) 天 $hours 小时 $minutes 分钟 $seconds 秒"
-  elif [ $duration_sec -ge 86400 ]; then
-    echo "消耗时间：$days 天 $hours 小时 $minutes 分钟 $seconds 秒"
-  elif [ $duration_sec -ge 3600 ]; then
-    echo "消耗时间：$hours 小时 $minutes 分钟 $seconds 秒"
-  elif [ $duration_sec -ge 60 ]; then
-    echo "消耗时间：$minutes 分钟 $seconds 秒"
-  else
-    echo "消耗时间：$seconds 秒"
+  local end_time_ms
+  local duration_ms
+  local years days hours minutes seconds ms
+  local parts=""
+
+  # 校验前置变量是否存在
+  if [ -z "${start_time_ms:-}" ]; then
+    log_error "start_time_ms 未定义！"
+    return 1
   fi
+
+  end_time_ms=$(date +%s%3N)
+  duration_ms=$((end_time_ms - start_time_ms))
+
+  # 防负数（系统时间回退场景）
+  if [ "$duration_ms" -lt 0 ]; then
+    log_warning "时间戳差值为负，系统时间可能被回拨"
+    duration_ms=0
+  fi
+
+  # 单位换算基准：1年=31536000秒 = 31536000000 毫秒
+  years=$((duration_ms / 31536000000))
+  days=$((duration_ms % 31536000000 / 86400000))
+  hours=$((duration_ms % 86400000 / 3600000))
+  minutes=$((duration_ms % 3600000 / 60000))
+  seconds=$((duration_ms % 60000 / 1000))
+  ms=$((duration_ms % 1000))
+
+  # 只追加非0的时间片段
+  [ "$years" -gt 0 ] && parts="$parts $years 年"
+  [ "$days" -gt 0 ] && parts="$parts $days 天"
+  [ "$hours" -gt 0 ] && parts="$parts $hours 小时"
+  [ "$minutes" -gt 0 ] && parts="$parts $minutes 分钟"
+  [ "$seconds" -gt 0 ] && parts="$parts $seconds 秒"
+
+  # 仅总时长不足1秒，并且毫秒>0，才追加毫秒
+  if [ "$duration_ms" -lt 1000 ] && [ "$ms" -gt 0 ]; then
+    parts="$parts $ms 毫秒"
+  fi
+
+  # 裁剪首尾空白
+  parts=$(printf "%s" "$parts" | xargs)
+
+  # 兜底：全部为0时输出 0 毫秒
+  [ -z "$parts" ] && parts="0 毫秒"
+
+  # 使用 printf 输出结果
+  printf "\n%s消耗时间：%s%s\n" "${CYAN}" "$parts" "${NORMAL}"
 }
 
 ##################################################################################################

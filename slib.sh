@@ -1,8 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC3043 disable=SC2086 disable=SC2059 disable=SC2039 disable=SC2034 disable=SC2154
 
-underline="________________________________________________________________"
-
 ##################################################################################################
 # 函数名：restore_cursor
 # 功能：恢复终端光标显示（使用tput命令将光标设置为正常可见状态）
@@ -2238,6 +2236,38 @@ memory_ok() {
 }
 
 ##################################################################################################
+# 函数名：mk_underline
+# 功能：生成并打印蓝色 Unicode 实心水平分隔线；交互式终端自动读取终端宽度，非交互固定80列
+#       输出逻辑：先空一行，再绘制整行连续实心横线，绘制完成后再空一行，用于区块分隔
+# 全局变量: BLUE NORMAL INTERACTIVE_MODE
+# 参数说明: 无参数
+# 返回值: 无返回值，直接向标准输出打印蓝色分隔线
+# 依赖：tput、printf
+# 备注：使用 Unicode U+2500 制表符「─」实心横线，无字符间隙；若终端不支持 Unicode 会显示方框/问号
+##################################################################################################
+mk_underline() {
+    local term_cols
+    if [ "${INTERACTIVE_MODE}" != "off" ]; then
+        term_cols=$(tput cols 2>/dev/null)
+    else
+        term_cols=80
+    fi
+    local max_width=80
+    if [ "$term_cols" -gt "$max_width" ]; then
+        term_cols=$max_width
+    fi
+
+    # 先开启蓝色，循环只打印 "-"，不每次重置颜色！
+    printf "${BLUE}"
+    local i=0
+    while [ "$i" -lt "$term_cols" ]; do
+        printf "─"
+        i=$((i + 1))
+    done
+    # 整根横线打完，再一次性重置颜色 + 换行
+    printf "${NORMAL}\n"
+}
+##################################################################################################
 # 函数名：password
 # 功能：交互式设置密码，强制密码复杂度校验（不少于8位，包含数字、大小写字母、特殊符号），二次确认密码
 # 全局变量: password
@@ -2246,7 +2276,7 @@ memory_ok() {
 # 依赖：task secret、颜色常量（RED/GREEN/CYAN/NORMAL/underline）
 ##################################################################################################
 password() {
-  printf "${underline}\n"
+  mk_underline
   printf "设置密码\n"
   printf "${CYAN}注意:密码不得少于8位、必须包含数字、大小写字母、特殊符号${NORMAL}\n"
 
@@ -2276,7 +2306,8 @@ password() {
     # 检查两次密码是否一致
     if [ "$pwd1" = "$pwd2" ]; then
       password=$pwd2
-      printf "\n密码设置 ${GREEN}成功${NORMAL} !\n${underline}\n"
+      printf "\n密码设置 ${GREEN}成功${NORMAL} !\n"
+      mk_underline
       break
     else
       printf "${RED}您两次输入的密码不一致，请重新输入${NORMAL}\n"
@@ -2577,44 +2608,41 @@ init_package_manager() {
 #   8. OFI dnf/yum 分支使用 eval 执行离线查询命令，用于兼容离线场景的命令封装
 ##################################################################################################
 check_install() {
-  local DEBIAN_FRONTEND="noninteractive"
-  local package installed check_str
-  local LC_ALL=C LANG=C
-  local cmd_prefix=""
-  case "$install_cmd" in
-  apt | apt-get) check_str="(none)" ;;
-  dnf | yum) check_str="Available Packages" ;;
-  *) return 0 ;;
-  esac
-  for package in "$@"; do
-    installed=""
-    cmd_prefix=""
-    case "${menu}:${install_cmd}" in
-    "OLI:"*)
-      installed=$($install_info "${package}" 2>/dev/null)
-      cmd_prefix="$install"
-      ;;
-    "OFI:dnf" | "OFI:yum")
-      installed=$(eval $offline_info "${package}" 2>/dev/null)
-      cmd_prefix="$offline_install"
-      ;;
-    "OFI:apt" | "OFI:apt-get")
-      installed=$($install_info "${package}" 2>/dev/null)
-      cmd_prefix="$install"
-      ;;
-    *) continue ;;
+    DEBIAN_FRONTEND="noninteractive"
+    local package installed cmd check_str
+    case "$install_cmd" in
+    apt | apt-get) check_str="(none)" ;;
+    dnf | yum) check_str="Available Packages" ;;
+    *) return 0 ;;
     esac
-    if [ -z "$installed" ]; then
-      log_debug "无法获取 $package 的安装信息"
-    elif printf '%s\n' "$installed" | grep -qE "$check_str"; then
-      # 仅在满足条件时现场拼接，不存入中间变量，消除SC2089
-      if [ -n "$cmd_prefix" ]; then
-        run ok "$cmd_prefix $package" "安装 $package"
-      fi
-    else
-      log_debug "$package 已安装"
-    fi
-  done
+
+    for package in "$@"; do
+        installed=""
+        cmd=""
+        case "$menu:$install_cmd" in
+        "OLI:"*)
+            installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
+            cmd="$install $package"
+            ;;
+        "OFI:dnf" | "OFI:yum")
+            installed=$(LC_ALL=C LANG=C eval $offline_info "$package" 2>/dev/null)
+            cmd="$offline_install $package"
+            ;;
+        "OFI:apt" | "OFI:apt-get")
+            installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
+            cmd="$install $package"
+            ;;
+        *) continue ;;
+        esac
+
+        if [ -z "$installed" ]; then
+            log_debug "无法获取 $package 的安装信息"
+        elif echo "$installed" | grep -qE "$check_str"; then
+            [ -n "$cmd" ] && run ok "$cmd" "安装 $package"
+        else
+            log_debug "$package 已安装"
+        fi
+    done
 }
 
 ##################################################################################################

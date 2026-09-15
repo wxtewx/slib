@@ -53,10 +53,6 @@ cleanup() {
     fi
   done
 
-  if [ "$exit_code" -ne 0 ]; then
-    echo
-  fi
-
   exit $exit_code
 }
 
@@ -68,12 +64,13 @@ if [ ! -t 0 ] && [ -z "${PS1-}" ]; then
   [ -z "${NONINTERACTIVE-}" ] && NONINTERACTIVE=1 # 仅当变量未定义时进行赋值
 fi
 
-# 捕获各类退出事件，包括正常退出以及强制终止（例如 Ctrl‑C）
+# 尝试捕获所有退出事件，包括正常退出或强制终止（例如 Ctrl-C）
 if [ "$INTERACTIVE_MODE" != "off" ]; then
   trap 'cleanup 2' INT
   trap 'cleanup 3' QUIT
   trap 'cleanup 15' TERM
-  trap 'cleanup 0' EXIT
+  # 在终端清理过程中保留失败状态码，包括仅交换内存相关错误
+  trap 'cleanup "$?"' 0
 fi
 
 # scolors - 颜色常量定义
@@ -501,6 +498,39 @@ shell_has_unicode() {
   fi
 }
 
+# 部分终端虽然支持 Unicode 往返处理，但徽章符号的渲染效果依然很差。
+# 允许强制指定两种模式之一；对于已知存在问题的终端，默认优先使用 ASCII。
+##################################################################################################
+# 函数名：status_badges_use_unicode
+# 功能：判断状态徽章是否启用Unicode字符渲染，自动兼容存在渲染问题的终端
+# 全局变量: SLIB_STATUS_BADGES, TERM_PROGRAM, TERM, GHOSTTY_BIN_DIR, GHOSTTY_RESOURCES_DIR
+# 选项说明:
+#   SLIB_STATUS_BADGES=auto（默认）：自动检测终端环境选择渲染模式
+#   SLIB_STATUS_BADGES=1/on/true/yes/unicode：强制使用Unicode徽章
+#   SLIB_STATUS_BADGES=0/off/false/no/ascii：强制使用ASCII徽章
+# 返回值: 0=使用Unicode徽章，1=使用ASCII徽章
+# 依赖：shell_has_unicode
+##################################################################################################
+status_badges_use_unicode() {
+  case "${SLIB_STATUS_BADGES:-auto}" in
+  1 | on | true | yes | unicode)
+    return 0
+    ;;
+  0 | off | false | no | ascii)
+    return 1
+    ;;
+  esac
+  if ! shell_has_unicode; then
+    return 1
+  fi
+  case "${TERM_PROGRAM:-}:${TERM:-}:${GHOSTTY_BIN_DIR:-}:${GHOSTTY_RESOURCES_DIR:-}" in
+  *ghostty*)
+    return 1
+    ;;
+  esac
+  return 0
+}
+
 # 根据预设参数配置旋转加载动画
 SPINNER_COLORCYCLE=0
 SPINNER_COLORNUM=6
@@ -600,7 +630,7 @@ run() {
   # 记录本次执行任务描述（去除颜色字符）
   msg_safe=$(echo "$msg" | prepare_log_for_nonterminal)
   printf "$log_pref ${msg_safe}: " >>${RUN_LOG}
-  if shell_has_unicode; then
+  if status_badges_use_unicode; then
     if [ $res -eq 0 ]; then
       printf "$log_pref 执行成功。\\n" >>${RUN_LOG}
       printf "\033[77G\033[K" # 定位并清空位置
@@ -2140,101 +2170,703 @@ get_distro() {
   return 0
 }
 
+# 为具备显式交换分区控制能力的安装程序提供版本化契约。
+SLIB_SWAP_API=2
+
+# swap_file_active [路径] [proc_swaps文件]
+# 精确匹配内核记录的路径名，绝不匹配其他交换区域的子串。
 ##################################################################################################
-# 函数名：memory_ok
-# 功能：检查系统总内存(物理内存+交换)是否满足最低要求，内存不足时可交互式创建/swap.vm交换文件扩容
-# 全局变量: RUN_LOG
-# 参数说明: $1 min_mem - 最低所需总内存(单位KB)；$2 disk_space_required - 安装所需额外磁盘空间(单位GB)
-# 返回值: 0-内存充足/用户选择不新建交换继续；1-用户选择终止安装；2-btrfs不支持交换文件；3-根盘空间不足；4-创建交换文件失败；5-启用交换文件失败
-# 依赖：swapon、awk、grep、df、dd、mkswap、tput、yesno、log_debug/log_error/log_warning/log_fatal 日志函数
+# 函数名：swap_file_active
+# 功能：检查指定路径的交换文件是否在/proc/swaps中处于激活状态
+# 全局变量: 无
+# 选项说明:
+#   $1：交换文件路径，默认 /swap.vm
+#   $2：swap信息文件路径，默认 /proc/swaps
+# 返回值: 0=已激活，1=未激活
+# 依赖：awk
 ##################################################################################################
-memory_ok() {
-  min_mem=$1
-  disk_space_required=$2
-  # 如果尚未设置 Virtualmin swap，请尝试设置
-  is_swap=$(swapon -s | grep /swap.vm)
-  if [ -n "$is_swap" ]; then
-    if [ -z "$min_mem" ]; then
-      min_mem=1048576
-    fi
-    # 检查可用 RAM 和交换区
-    mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-    swap_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
-    all_mem=$((mem_total + swap_total))
-    swap_min=$((1286144 - all_mem))
+swap_file_active() {
+  awk -v path="${1:-/swap.vm}" 'NR > 1 && $1 == path { found = 1 }
+    END { exit found ? 0 : 1 }' "${2:-/proc/swaps}" 2>/dev/null
+}
 
-    if [ "$swap_min" -lt '262144' ]; then
-      swap_min=262144
-    fi
+# kb_size_h 千字节 - 单位采用二进制换算，与Linux内存统计口径保持一致。
+##################################################################################################
+# 函数名：kb_size_h
+# 功能：将千字节数值转为人类可读的MiB/GiB文本（二进制单位）
+# 全局变量: 无
+# 选项说明: $1 大小，单位KiB
+# 返回值: 格式化后的容量字符串
+# 依赖：算术运算
+##################################################################################################
+kb_size_h() {
+  if [ $(($1 % 1048576)) -eq 0 ]; then
+    echo "$(($1 / 1048576)) GiB"
+  else
+    echo "$(($1 / 1024)) MiB"
+  fi
+}
 
-    min_mem_h=$((min_mem / 1024))
-    if [ "$all_mem" -gt "$min_mem" ]; then
-      log_debug "内存大于 ${min_mem_h} MB，应该足够了。"
+# swap_size_wanted 总内存 物理内存总量 可用磁盘千字节数
+# 自动大小计算属于安装器策略，并非工作负载或休眠的尺寸规则：
+# 目标上限填充至8GiB，同时受两倍物理内存与可用磁盘空间限制。
+##################################################################################################
+# 函数名：swap_size_wanted
+# 功能：计算推荐交换文件大小，遵循安装器自动分配策略
+# 全局变量: swapsize
+# 选项说明:
+#   $1：内存+交换总容量(KiB)
+#   $2：物理内存总量(KiB)
+#   $3：可用磁盘空间(KiB)
+# 返回值: 推荐交换大小(KiB)
+# 依赖：无
+##################################################################################################
+swap_size_wanted() {
+  if [ -n "$swapsize" ]; then
+    if [ "$3" -ge "$swapsize" ]; then echo "$swapsize"; else echo 0; fi
+    return 0
+  fi
+  wanted_size=$(((8388608 - $1 + 1048575) / 1048576 * 1048576))
+  if [ "$1" -ge 8388608 ]; then
+    echo 0
+    return 0
+  fi
+  wanted_ram_cap=$((($2 * 2 + 1048575) / 1048576 * 1048576))
+  [ "$wanted_size" -le "$wanted_ram_cap" ] || wanted_size=$wanted_ram_cap
+  if [ "$3" -ge 41943040 ]; then
+    wanted_cap=6291456
+  elif [ "$3" -ge 20971520 ]; then
+    wanted_cap=3145728
+  elif [ "$3" -ge 10485760 ]; then
+    wanted_cap=2097152
+  elif [ "$3" -ge 5242880 ]; then
+    wanted_cap=1048576
+  else
+    wanted_cap=0
+  fi
+  [ "$wanted_size" -le "$wanted_cap" ] || wanted_size=$wanted_cap
+  echo "$wanted_size"
+}
+
+# swap_fstab_check 路径
+# 保留管理员原有配置；存在冲突或重复条目时，必须由人工处理，
+# 才能修改正在运行的交换空间。
+##################################################################################################
+# 函数名：swap_fstab_check
+# 功能：校验/etc/fstab中指定交换条目的合法性，检查重复、非法选项
+# 全局变量: 无
+# 选项说明: $1 交换文件路径
+# 返回值: 0=配置合法，1=存在问题
+# 依赖：awk, /etc/fstab
+##################################################################################################
+swap_fstab_check() {
+  awk -v path="$1" '
+    $1 == path {
+      count++
+      if ($3 != "swap" || NF < 4) bad = 1
+      n = split($4, opts, ",")
+      for (i = 1; i <= n; i++)
+        if (opts[i] == "noauto" || opts[i] ~ /^x-systemd\./) bad = 1
+    }
+    END { exit (bad || count > 1) ? 1 : 0 }
+  ' /etc/fstab
+}
+
+# swap_systemd_ordering - Btrfs会在整个文件系统层面串行执行交换空间激活。
+# 在常规交换单元完成启动后，再启动我们的可选交换文件；
+# 保留正常关机顺序，同时避免与swap.target产生依赖循环。
+##################################################################################################
+# 函数名：swap_systemd_ordering
+# 功能：输出Btrfs交换文件专用systemd单元的启动顺序配置文本
+# 全局变量: 无
+# 选项说明: 无
+# 返回值: systemd配置文本
+# 依赖：cat
+##################################################################################################
+swap_systemd_ordering() {
+  cat <<'SWAP_UNIT'
+# 由 Local 托管：串行处理 Btrfs 交换文件激活。
+[Unit]
+DefaultDependencies=no
+After=swap.target systemd-remount-fs.service
+Conflicts=umount.target
+Before=umount.target
+SWAP_UNIT
+}
+
+# swap_resume_partition 主设备号:次设备号
+# 只有经过校验的交换块设备，才独立于我们常规的交换文件。
+# 特别注意：Btrfs文件的st_dev并不是其底层块设备编号。
+##################################################################################################
+# 函数名：swap_resume_partition
+# 功能：校验给定主:次设备号是否为合法的swap类型块设备
+# 全局变量: 无
+# 选项说明: $1 主设备号:次设备号
+# 返回值: 0=是合法交换块设备，1=不是
+# 依赖：blkid
+##################################################################################################
+swap_resume_partition() {
+  [ -b "/dev/block/$1" ] || return 1
+  swap_resume_type=$(blkid -p -s TYPE -o value "/dev/block/$1" 2>/dev/null) || return 1
+  [ "$swap_resume_type" = swap ]
+}
+
+# swap_resume_conflict
+# 非零偏移代表交换文件休眠恢复。仅当目标经过校验时，零偏移分区休眠恢复才是安全的；
+# 存在未解析或格式异常的数据时直接拒绝。
+##################################################################################################
+# 函数名：swap_resume_conflict
+# 功能：检测内核休眠恢复配置是否与交换文件存在冲突
+# 全局变量: 无
+# 选项说明: 无
+# 返回值: 0=存在冲突，1=无冲突
+# 依赖：awk、/proc/cmdline、/sys/power/resume、/sys/power/resume_offset、swap_resume_partition
+##################################################################################################
+swap_resume_conflict() {
+  # 检查命令行中所有resume_offset参数，避免整数溢出与八进制解析问题。
+  if ! awk '
+    { for (i = 1; i <= NF; i++) if ($i ~ /^resume_offset=/) {
+        sub(/^resume_offset=/, "", $i)
+        if ($i !~ /^0+$/) conflict = 1
+      }
+    }
+    END { exit conflict ? 1 : 0 }
+  ' /proc/cmdline; then return 0; fi
+  if [ -e /sys/power/resume_offset ]; then
+    swap_resume_offset=$(cat /sys/power/resume_offset) || return 0
+    case "$swap_resume_offset" in '' | *[!0]*) return 0 ;; esac
+  fi
+  # 没有休眠恢复接口的内核不存在待检查的活跃休眠设备。
+  [ -e /sys/power/resume ] || return 1
+  swap_resume_dev=$(cat /sys/power/resume) || return 0
+  [ "$swap_resume_dev" != '0:0' ] || return 1
+  if ! printf '%s\n' "$swap_resume_dev" | grep -Eq '^[0-9]+:[0-9]+$'; then return 0; fi
+  if swap_resume_partition "$swap_resume_dev"; then return 1; fi
+  return 0
+}
+
+# swap_plan [安装磁盘GB容量]
+# 只读预检查函数，供确认提示与执行器共用。
+# 仅管理传统的 /swap.vm 以及专用Btrfs交换文件。
+##################################################################################################
+# 函数名：swap_plan
+# 功能：交换空间预规划与预检，计算操作动作、目标大小与错误信息，只读不执行变更
+# 全局变量: setup_only noswap swapsize swap_action swap_error swap_size swap_old_size swap_active swap_path swap_reserve swap_fs
+# 选项说明: $1 安装磁盘容量(GB)，默认1
+# 返回值: 0=预检通过，1=预检失败，错误存入swap_error
+# 依赖：findmnt、stat、blkid、awk、swap_file_active、swap_fstab_check、swap_size_wanted、swap_resume_conflict
+##################################################################################################
+swap_plan() {
+  swap_action=none
+  swap_error=
+  swap_size=0
+  swap_old_size=0
+  swap_active=0
+  swap_path=/swap.vm
+  swap_reserve=${1:-1}
+  if [ -n "$setup_only" ] || [ -n "$noswap" ]; then return 0; fi
+  # 在无root权限时，blkid等探测命令会静默返回空，
+  # 这会被误判为不安全或无法识别的文件。
+  if [ "$(id -u)" -ne 0 ]; then
+    swap_error="交换空间管理需要 root 权限。"
+    return 1
+  fi
+  # 同时校验库API版本，因为除安装器外还有其他调用方。
+  if [ -n "$swapsize" ]; then
+    case "$swapsize" in
+    *[!0-9]* | '')
+      swap_error="交换大小单位为 KiB，输入无效。"
+      return 1
+      ;;
+    esac
+    swapsize=${swapsize#"${swapsize%%[!0]*}"}
+    swapsize=${swapsize:-0}
+    if [ "${#swapsize}" -gt 10 ] || [ "$swapsize" -gt 1073740800 ] ||
+      [ $((swapsize % 1024)) -ne 0 ]; then
+      swap_error="交换大小必须为 MiB 整数倍，且小于 1TiB。"
+      return 1
+    fi
+  fi
+  swap_fs=$(findmnt -n -o FSTYPE -T /) || {
+    swap_error="无法检测根文件系统类型。"
+    return 1
+  }
+  # 在选择托管路径时，读取持久化引用，
+  # 便于修复或清理上次中断运行残留的缺失文件。
+  swap_legacy_ref=$(awk '$1 == "/swap.vm" {print 1; exit}' /etc/fstab)
+  swap_btrfs_ref=$(awk '$1 == "/swap.local/swapfile" {print 1; exit}' /etc/fstab)
+  if [ -e /swap.local ] || [ -L /swap.local ]; then
+    if [ -L /swap.local ] || [ ! -d /swap.local ] ||
+      [ "$(stat -c '%u:%a' /swap.local)" != '0:700' ]; then
+      swap_error="/swap.local 目录不安全，拒绝修改交换空间。"
+      return 1
+    fi
+  fi
+  if [ -e /swap.vm ] || [ -L /swap.vm ] || [ "$swap_legacy_ref" = 1 ]; then
+    if [ -e /swap.local/swapfile ] || [ -L /swap.local/swapfile ] ||
+      [ "$swap_btrfs_ref" = 1 ]; then
+      swap_error="两处交换文件同时存在，请手动处理冲突。"
+      return 1
+    fi
+  elif [ "$swap_fs" = btrfs ] || [ -d /swap.local ] || [ "$swap_btrfs_ref" = 1 ]; then
+    # 独立子卷可防止Btrfs交换文件阻塞根目录快照。
+    swap_path=/swap.local/swapfile
+  fi
+  # 自动安装模式下，已存在的 Local 交换文件保持不变。
+  if [ -z "$swapsize" ] && { [ -e "$swap_path" ] || [ -L "$swap_path" ]; }; then
+    return 0
+  fi
+  if [ -e "$swap_path" ] || [ -L "$swap_path" ]; then
+    if [ -L "$swap_path" ] || [ ! -f "$swap_path" ] ||
+      [ "$(stat -c '%u:%h' "$swap_path")" != '0:1' ] ||
+      [ "$(blkid -p -s TYPE -o value "$swap_path" 2>/dev/null)" != swap ]; then
+      swap_error="拒绝替换 $swap_path 位置不安全或无法识别的文件。"
+      return 1
+    fi
+    swap_old_bytes=$(stat -c %s "$swap_path") || return 1
+    swap_old_size=$((swap_old_bytes / 1024))
+  fi
+  if swap_file_active "$swap_path"; then swap_active=1; fi
+  # 仅为托管路径写入无歧义、标准的fstab条目。
+  if [ -L /etc/fstab ] || [ ! -f /etc/fstab ] || ! swap_fstab_check "$swap_path"; then
+    swap_error="$swap_path 在 /etc/fstab 中的配置存在冲突或不安全。"
+    return 1
+  fi
+  # 第二条启动引用可能在删除后依然残留，或覆盖我们fstab配置。
+  # 不接管符号链接别名或原生systemd单元。
+  if ! awk -v path="$swap_path" '$1 ~ /^\// && $1 != path {print $1}' /etc/fstab |
+    while IFS= read -r swap_source; do
+      swap_source=$(printf '%b' "$swap_source")
+      if [ "$(readlink -f "$swap_source")" = "$swap_path" ]; then exit 1; fi
+    done; then
+    swap_error="/etc/fstab 中有其他条目通过别名指向 $swap_path。"
+    return 1
+  fi
+  swap_unit=${swap_path#/}
+  swap_unit=$(printf '%s' "$swap_unit" | tr / -).swap
+  swap_order_dir="/etc/systemd/system/$swap_unit.d"
+  swap_order_file="$swap_order_dir/50-local-swap.conf"
+  for swap_unit_dir in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+    if [ -e "$swap_unit_dir/$swap_unit" ] || [ -L "$swap_unit_dir/$swap_unit" ] ||
+      [ -L "$swap_unit_dir/$swap_unit.d" ]; then
+      swap_error="$swap_path 存在自定义 systemd 配置，需要人工核查。"
+      return 1
+    fi
+    # 只有我们未修改的依赖降载配置文件才支持自动合并。
+    for swap_dropin in "$swap_unit_dir/$swap_unit.d/"* "$swap_unit_dir/$swap_unit.d/".[!.]* "$swap_unit_dir/$swap_unit.d/"..?*; do
+      [ -e "$swap_dropin" ] || [ -L "$swap_dropin" ] || continue
+      if [ "$swap_dropin" != "$swap_order_file" ] || [ -L "$swap_dropin" ] ||
+        [ ! -f "$swap_dropin" ] || [ "$(cat "$swap_dropin")" != "$(swap_systemd_ordering)" ]; then
+        swap_error="$swap_path 存在自定义 systemd 配置，需要人工核查。"
+        return 1
+      fi
+    done
+  done
+  swap_options=$(awk -v path="$swap_path" '$1 == path {print $4}' /etc/fstab)
+  swap_options=${swap_options:-defaults}
+  swap_old_priority=$(awk -v path="$swap_path" '$1 == path {print $5}' /proc/swaps)
+  swap_fstab_ref=$(awk -v path="$swap_path" '$1 == path {print 1; exit}' /etc/fstab)
+  if [ "$swapsize" = 0 ]; then
+    # 如果没有文件、启动条目或降载配置，则无需删除任何内容。
+    if [ ! -e "$swap_path" ] && [ ! -L "$swap_path" ] && [ "$swap_active" = 0 ] &&
+      [ "$swap_fstab_ref" != 1 ] && [ ! -e "$swap_order_file" ]; then
       return 0
-    else
-      log_error "内存低于 ${min_mem_h} MB。 可能无法进行完整安装。"
     fi
-
-    # 我们需要交换，所以询问并打开一些。
-    swap_min_h=$((swap_min / 1024))
-    echo
-    echo "  您的系统的可用内存和交换空间少于 ${min_mem_h} MB。"
-    echo "  安装可能会失败，特别是在 Debian/Ubuntu 系统上（安"
-    echo "  装大量软件包时 apt-get 会变得非常大）。 你可以退出"
-    echo "  您可以退出并使用 --minimal 标志重新安装，以安装更紧凑的软件包选择"
-    echo "  或者我们可以尝试为您创建一个交换文件。要创建交换文件，除了用于安装软件包的"
-    echo "  $disk_space_required GB 可用空间之外"
-    echo "  您还需要 ${swap_min_h} MB 可用磁盘空间。"
-    echo
-    echo "  你想继续吗？ 如果继续"
-    printf "  您将可以选择创建交换文件。 (y/n) "
-    if ! yesno; then
-      return 1 # 当该函数返回 1 时应退出
-    fi
-    echo
-    echo "  您想让我尝试创建一个交换文件吗？"
-    echo "   除了用于安装的 $disk_space_required GB 之外，这还需要至少 ${swap_min_h} MB 的"
-
-    printf "  可用空间。 (y/n) "
-    if ! yesno; then
-      log_warning "继续而不创建交换文件。 安装可能会失败。"
+    swap_action=remove
+  elif [ -n "$swapsize" ] && [ "$swap_old_size" -eq "$swapsize" ]; then
+    swap_action=reuse
+    swap_size=$swapsize
+  else
+    # 调整大小操作需要保留旧文件，同时预留存放新文件的空间。
+    # 在安装估算值之外额外保留1GiB余量。
+    swap_avail=$(LC_ALL=C df -Pk / | awk 'NR == 2 {print $4}')
+    swap_mem=$(awk '$1 == "MemTotal:" {print $2}' /proc/meminfo)
+    swap_total=$(awk '$1 == "SwapTotal:" {print $2}' /proc/meminfo)
+    case "$swap_avail:$swap_mem:$swap_total" in
+    *[!0-9:]* | :* | *::* | *:)
+      swap_error="无法读取内存或磁盘容量信息。"
+      return 1
+      ;;
+    esac
+    swap_size=$(swap_size_wanted "$((swap_mem + swap_total))" "$swap_mem" \
+      "$((swap_avail - (swap_reserve + 1) * 1048576))")
+    if [ "$swap_size" -eq 0 ]; then
+      if [ -n "$swapsize" ]; then
+        swap_error="磁盘剩余空间不足，无法存放替换交换文件与预留余量。"
+        return 1
+      fi
       return 0
     fi
-
-    # 检查 btrfs，因为它无法安全地托管交换文件。
-    root_fs_type=$(grep -v "^$\\|^\\s*#" /etc/fstab | awk '{print $2 " " $3}' | grep "/ " | cut -d' ' -f2)
-    if [ "$root_fs_type" = "btrfs" ]; then
-      log_fatal "您的根文件系统似乎正在运行 btrfs。"
-      log_fatal "在 btrfs 文件系统上创建交换文件是不安全的。"
-      log_fatal "您需要使用 --minimal 安装或手动创建交换文件（在某些其他文件系统上）。"
-      return 2
-    fi
-
-    # 检查是否有足够的空间。
-    root_fs_avail=$(df / | grep -v Filesystem | awk '{print $4}')
-    if [ "$root_fs_avail" -lt $((swap_min + 358400)) ]; then
-      root_fs_avail_h=$((root_fs_avail / 1024))
-      log_fatal "根文件系统只有 $root_fs_avail_h MB 可用，这太小了。"
-      log_fatal "您需要使用 --minimal 安装向 '/' 添加更多空间。"
-      return 3
-    fi
-
-    # Create a new file
-    if ! dd if=/dev/zero of=/swap.vm bs=1024 count=$swap_min 1>>${RUN_LOG} 2>&1; then
-      log_fatal "创建交换文件 /swap.vm 失败。"
-      return 4
-    fi
-    chmod 0600 /swap.vm 1>>${RUN_LOG} 2>&1
-    mkswap /swap.vm 1>>${RUN_LOG} 2>&1
-    if ! swapon /swap.vm 1>>${RUN_LOG} 2>&1; then
-      log_fatal "启用交换文件失败。 如果这是虚拟机，您的提供商可能会禁止它。"
-      return 5
-    fi
-    echo "/swap.vm          swap            swap    defaults        0 0" >>/etc/fstab
+    swap_action=create
+    [ "$swap_old_size" -eq 0 ] || swap_action=resize
+  fi
+  # 替换文件会改变休眠恢复偏移量。不猜测现有交换文件的休眠配置是否属于当前文件。
+  if [ "$swap_old_size" -gt 0 ] &&
+    { [ "$swap_action" = resize ] || [ "$swap_action" = remove ]; } &&
+    swap_resume_conflict; then
+    swap_error="已配置交换文件休眠，或无法排除该情况；调整/删除交换文件需要人工核查。"
+    return 1
+  fi
+  # Btrfs创建交换文件必须使用其原生工具与独立子卷。
+  # 传统根目录下Btrfs /swap.vm可以复用或删除，但不会在根目录重建。
+  if [ "$swap_action" = create ] || [ "$swap_action" = resize ]; then
+    case "$swap_fs" in
+    ext2 | ext3 | ext4 | xfs) ;;
+    btrfs)
+      if [ "$swap_path" = /swap.vm ] ||
+        ! btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+        swap_error="Btrfs交换文件创建需要 btrfs-progs 6.1+ 以及路径 /swap.local/swapfile。"
+        return 1
+      fi
+      if [ -d /swap.local ] &&
+        ! btrfs subvolume show /swap.local >/dev/null 2>&1; then
+        swap_error="/swap.local 必须是独立的 Btrfs 子卷。"
+        return 1
+      fi
+      ;;
+    *)
+      swap_error="文件系统 $swap_fs 不支持创建交换文件。"
+      return 1
+      ;;
+    esac
   fi
   return 0
 }
 
+# swap_size_planned [安装磁盘GB容量] - 用于兼容旧调用方。
+##################################################################################################
+# 函数名：swap_size_planned
+# 功能：兼容旧调用方的包装函数，返回计划创建/调整的交换大小
+# 全局变量: swap_action swap_size
+# 选项说明: $1 安装磁盘容量(GB)
+# 返回值: 计划交换大小(KiB)，无操作返回0
+# 依赖：swap_plan
+##################################################################################################
+swap_size_planned() (
+  swap_plan "${1:-1}" || return 1
+  case "$swap_action" in create | resize) echo "$swap_size" ;; *) echo 0 ;; esac
+)
+
+# swap_plan_message - 输出给用户的变更描述，不包含底层存储细节。
+##################################################################################################
+# 函数名：swap_plan_message
+# 功能：生成展示给用户的交换变更文本提示
+# 全局变量: swap_action swap_size swap_old_size
+# 选项说明: 无
+# 返回值: 本地化提示文本
+# 依赖：kb_size_h
+##################################################################################################
+swap_plan_message() {
+  case "$swap_action" in
+  create) echo "将创建大小为 $(kb_size_h "$swap_size") 的交换空间。" ;;
+  resize) echo "交换空间将从 $(kb_size_h "$swap_old_size") 调整至 $(kb_size_h "$swap_size")。" ;;
+  remove) echo "将删除本安装程序之前配置的交换空间。" ;;
+  reuse) echo "复用现有大小为 $(kb_size_h "$swap_size") 的交换空间。" ;;
+  esac
+}
+
+# swap_can_deactivate 路径
+# 执行swapoff前保留保守的内存余量，否则会触发内存压力。
+# 若内存占用发生变化，内核状态才是最终判定依据。
+##################################################################################################
+# 函数名：swap_can_deactivate
+# 功能：安全检查：判断当前内存余量是否足够执行swapoff停用交换文件
+# 全局变量: 无
+# 选项说明: $1 交换文件路径
+# 返回值: 0=可以安全停用，1=内存不足不可停用
+# 依赖：awk、log_error
+##################################################################################################
+swap_can_deactivate() {
+  swap_used=$(awk -v path="$1" '$1 == path {print $4}' /proc/swaps)
+  swap_available=$(awk '$1 == "MemAvailable:" {print $2}' /proc/meminfo)
+  if [ -z "$swap_used" ] || [ -z "$swap_available" ] ||
+    [ "$swap_available" -lt "$((swap_used + 262144))" ]; then
+    log_error "可用内存不足，无法安全停用 $1（需要预留 256 MiB）。"
+    return 1
+  fi
+}
+
+# swap_write_fstab - 准备原子更新，保留无关条目与原有选项；
+# nofail 保证交换不可用时不会导致启动失败。
+##################################################################################################
+# 函数名：swap_write_fstab
+# 功能：生成fstab临时文件，更新对应交换条目并添加nofail选项，不直接覆盖原文件
+# 全局变量: swap_path swap_action swap_fstab_tmp swap_fstab_before
+# 选项说明: 无
+# 返回值: 0=成功，1=失败
+# 依赖：mktemp、cp、awk
+##################################################################################################
+swap_write_fstab() {
+  swap_fstab_tmp=$(mktemp /etc/.fstab.local.XXXXXX) || return 1
+  swap_fstab_before=$(cksum /etc/fstab) || return 1
+  cp --preserve=all /etc/fstab "$swap_fstab_tmp" || return 1
+  awk -v path="$swap_path" -v action="$swap_action" '
+    $1 == path {
+      found = 1
+      if (action == "remove") next
+      if ($4 !~ /(^|,)nofail(,|$)/) $4 = $4 ",nofail"
+    }
+    { print }
+    END {
+      if (!found && action != "remove")
+        print path " none swap defaults,nofail 0 0"
+    }
+  ' /etc/fstab >"$swap_fstab_tmp"
+}
+
+# swap_write_ordering - 在写入fstab条目前配置启动顺序。
+# 内容相同时保留原有文件，记录新建文件用于失败回滚清理。
+##################################################################################################
+# 函数名：swap_write_ordering
+# 功能：生成Btrfs交换文件对应的systemd依赖降载配置文件
+# 全局变量: swap_fs swap_action swap_order_dir swap_order_file swap_order_tmp swap_order_created
+# 选项说明: 无
+# 返回值: 0=成功，1=失败
+# 依赖：mkdir、mktemp、chmod、mv、swap_systemd_ordering
+##################################################################################################
+swap_write_ordering() {
+  if [ "$swap_fs" != btrfs ] || [ ! -d /run/systemd/system ] ||
+    [ "$swap_action" = remove ] || [ -f "$swap_order_file" ]; then return 0; fi
+  if [ ! -d "$swap_order_dir" ]; then mkdir -m 0755 "$swap_order_dir" || return 1; fi
+  swap_order_tmp=$(mktemp "$swap_order_dir/.local.XXXXXX") || return 1
+  swap_systemd_ordering >"$swap_order_tmp" && chmod 0644 "$swap_order_tmp" || return 1
+  swap_order_created=1
+  mv -f "$swap_order_tmp" "$swap_order_file"
+}
+
+# swap_commit_fstab - 分配期间若管理员手动修改fstab，则不覆盖。
+##################################################################################################
+# 函数名：swap_commit_fstab
+# 功能：原子提交fstab变更；校验cksum防止并发修改后覆盖
+# 全局变量: swap_fstab_before swap_fstab_tmp
+# 选项说明: 无
+# 返回值: 0=提交成功，1=检测到外部修改，拒绝提交
+# 依赖：cksum、mv、log_error
+##################################################################################################
+swap_commit_fstab() {
+  if [ "$(cksum /etc/fstab)" != "$swap_fstab_before" ]; then
+    log_error "交换配置过程中 /etc/fstab 发生变更，拒绝覆盖。"
+    return 1
+  fi
+  mv -f "$swap_fstab_tmp" /etc/fstab
+}
+
+# swap_cleanup - 操作失败时回滚正在运行的变更，再删除临时文件。
+# 若恢复失败，保留旧文件并输出路径给运维人员。
+##################################################################################################
+# 函数名：swap_cleanup
+# 功能：事务回滚与清理钩子，操作失败时恢复交换状态，清理临时文件与备份
+# 全局变量: swap_result swap_committed swap_reuse_activated swap_new_installed swap_path swap_backup swap_old_off swap_old_priority swap_options swap_new swap_fstab_tmp swap_order_tmp swap_order_created RUN_LOG
+# 选项说明: 无
+# 返回值: 脚本最终退出码
+# 依赖：trap、swapoff、swapon、stat、rm、mv、log_error
+##################################################################################################
+swap_cleanup() {
+  swap_result=$?
+  trap - 0 HUP INT TERM
+  if [ "$swap_result" -ne 0 ]; then
+    log_error "交换空间操作失败；详情查看 $RUN_LOG。"
+  fi
+  if [ "$swap_committed" != 1 ]; then
+    # 持久化修复失败时，同样撤销已激活的旧文件。
+    # 即使内存压力导致无法停用，也保留原文件。
+    if [ "$swap_reuse_activated" = 1 ] && ! swapoff "$swap_path" >>"$RUN_LOG" 2>&1; then
+      log_error "无法撤销 $swap_path 的激活状态；原文件保持启用。"
+      swap_result=1
+    fi
+    if [ "$swap_new_installed" = 1 ] && swap_file_active "$swap_path"; then
+      if ! swapoff "$swap_path" >>"$RUN_LOG" 2>&1; then
+        log_error "回滚无法停用 $swap_path；已保留备份 $swap_backup。"
+        exit 1
+      fi
+    fi
+    if [ -n "$swap_backup" ] && [ -e "$swap_backup" ]; then
+      # 重命名失败时可能新旧文件名指向同一个inode。
+      if [ "$(stat -c '%d:%i' "$swap_backup")" = "$(stat -c '%d:%i' "$swap_path" 2>/dev/null)" ]; then
+        rm -f "$swap_backup"
+      elif ! mv -f "$swap_backup" "$swap_path"; then
+        log_error "请手动从 $swap_backup 恢复 $swap_path。"
+        exit 1
+      fi
+    elif [ "$swap_new_installed" = 1 ]; then
+      rm -f "$swap_path"
+    fi
+    if [ "$swap_old_off" = 1 ]; then
+      if [ "${swap_old_priority:--1}" -ge 0 ]; then
+        swap_options="$swap_options,pri=$swap_old_priority"
+      fi
+      swapon --options="$swap_options" "$swap_path" >>"$RUN_LOG" 2>&1 ||
+        log_error "无法重新激活原文件 $swap_path；文件内容已保留。"
+    fi
+  fi
+  if [ -n "$swap_new" ] && [ -e "$swap_new" ]; then
+    # 信号可能在测试激活后、测试停用前到达。
+    if swap_file_active "$swap_new" && ! swapoff "$swap_new" >>"$RUN_LOG" 2>&1; then
+      log_error "临时交换文件 $swap_new 仍处于激活状态，已保留用于恢复。"
+      swap_result=1
+    else
+      rm -f "$swap_new"
+    fi
+  fi
+  [ -z "$swap_fstab_tmp" ] || rm -f "$swap_fstab_tmp"
+  [ -z "$swap_order_tmp" ] || rm -f "$swap_order_tmp"
+  if [ "$swap_committed" != 1 ] && [ "$swap_order_created" = 1 ]; then
+    rm -f "$swap_order_file"
+    rmdir "$swap_order_dir" 2>/dev/null || :
+  fi
+  # 仅当运行时交换与fstab写入均成功后，才删除旧文件备份。
+  if [ "$swap_committed" = 1 ] && [ -n "$swap_backup" ]; then
+    rm -f "$swap_backup" || swap_result=1
+  fi
+  exit "$swap_result"
+}
+
+# swap_setup [安装磁盘GB容量]
+# 串行执行并发任务，分阶段完成替换；
+# 在激活与持久化配置全部成功前，保留旧inode。
+# 使用子shell隔离锁、umask、事务变量与信号捕获。
+##################################################################################################
+# 函数名：swap_setup
+# 功能：执行交换空间事务：创建/调整/删除交换文件，带锁、事务回滚、systemd配置更新，子shell隔离环境
+# 全局变量: setup_only noswap swapsize RUN_LOG swap_action swap_path swap_fs swap_size swap_old_size swap_options swap_new swap_backup swap_fstab_tmp swap_order_tmp swap_new_installed swap_old_off swap_committed swap_order_created swap_reuse_activated
+# 选项说明: $1 安装磁盘容量(GB)
+# 返回值: 0=成功，1=失败
+# 依赖：flock、swap_plan、swap_write_fstab、swap_write_ordering、swap_can_deactivate、swapoff、swapon、btrfs、dd、mkswap、mktemp、swap_commit_fstab、systemctl、swap_cleanup
+##################################################################################################
+swap_setup() (
+  if [ -n "$setup_only" ] || [ -n "$noswap" ]; then return 0; fi
+  if [ "$(id -u)" -ne 0 ]; then
+    log_error "交换空间管理需要 root 权限。"
+    return 1
+  fi
+  RUN_LOG=${RUN_LOG:-/dev/null}
+  umask 077
+  exec 9>/run/local-swap.lock || return 1
+  if ! flock -n 9; then
+    log_error "另一项交换空间操作正在运行。"
+    return 1
+  fi
+  swap_plan "${1:-1}" || {
+    log_error "$swap_error"
+    return 1
+  }
+  [ "$swap_action" != none ] || return 0
+  swap_new='' swap_backup='' swap_fstab_tmp='' swap_order_tmp=''
+  swap_new_installed=0 swap_old_off=0 swap_committed=0 swap_order_created=0 swap_reuse_activated=0
+  trap 'swap_cleanup' 0
+  trap 'exit 1' HUP INT TERM
+  # 预览阶段已经输出变更提示；仅在日志中记录执行详情。
+  printf 'Swap plan: action=%s path=%s filesystem=%s size=%sKiB previous=%sKiB options=%s\n' \
+    "$swap_action" "$swap_path" "$swap_fs" "$swap_size" "$swap_old_size" "$swap_options" >>"$RUN_LOG"
+  swap_write_fstab || {
+    log_error "无法准备 /etc/fstab 更新。"
+    return 1
+  }
+  swap_write_ordering || {
+    log_error "无法配置 Btrfs 交换文件启动顺序。"
+    return 1
+  }
+  # 文件匹配时仅需处理权限、激活与持久化配置修复。
+  if [ "$swap_action" = reuse ]; then
+    chmod 0600 "$swap_path" || return 1
+    if [ "$swap_active" = 0 ]; then
+      swapon --options="$swap_options" "$swap_path" >>"$RUN_LOG" 2>&1 || return 1
+      swap_reuse_activated=1
+    fi
+  elif [ "$swap_action" = remove ]; then
+    if [ "$swap_active" = 1 ]; then
+      swap_can_deactivate "$swap_path" || return 1
+      swapoff "$swap_path" >>"$RUN_LOG" 2>&1 || return 1
+      swap_old_off=1
+    fi
+    # 在删除文件前先移除持久化配置，避免中断后启动项指向已删除文件。
+    swap_commit_fstab || return 1
+    swap_committed=1
+    rm -f "$swap_path" || return 1
+    if [ -f "$swap_order_file" ]; then
+      rm -f "$swap_order_file" || return 1
+      rmdir "$swap_order_dir" 2>/dev/null || :
+    fi
+  else
+    # Btrfs使用独立子卷；所有新建文件初始仅root可访问。
+    if [ "$swap_path" = /swap.local/swapfile ] && [ ! -d /swap.local ]; then
+      if [ "$swap_fs" = btrfs ]; then
+        btrfs subvolume create /swap.local >>"$RUN_LOG" 2>&1 &&
+          chmod 0700 /swap.local || return 1
+      else
+        mkdir -m 0700 /swap.local || return 1
+      fi
+    fi
+    swap_new=$(mktemp "${swap_path}.new.XXXXXX") || return 1
+    if [ "$swap_fs" = btrfs ]; then
+      # 原生工具会自行创建目标路径。
+      rm -f "$swap_new" || return 1
+      btrfs filesystem mkswapfile --size "${swap_size}K" "$swap_new" >>"$RUN_LOG" 2>&1 || return 1
+    else
+      # 写入全部数据块，兼容所有支持的ext与XFS版本，
+      # 包含那些不支持带空洞fallocate交换文件的版本。
+      dd if=/dev/zero of="$swap_new" bs=1048576 count=$((swap_size / 1024)) >>"$RUN_LOG" 2>&1 &&
+        mkswap "$swap_new" >>"$RUN_LOG" 2>&1 || return 1
+    fi
+    chmod 0600 "$swap_new" || return 1
+    # 在修改旧文件前，先验证新文件可成功激活。
+    swapon "$swap_new" >>"$RUN_LOG" 2>&1 || return 1
+    if ! swapoff "$swap_new" >>"$RUN_LOG" 2>&1; then
+      log_error "无法停用测试用新文件 $swap_new；已保留该文件用于恢复。"
+      swap_new=
+      return 1
+    fi
+    if [ "$swap_active" = 1 ]; then
+      swap_can_deactivate "$swap_path" || return 1
+      swapoff "$swap_path" >>"$RUN_LOG" 2>&1 || return 1
+      swap_old_off=1
+    fi
+    if [ "$swap_old_size" -gt 0 ]; then
+      # 硬链接保留原inode；rename原子替换启动路径，不会出现文件缺失窗口。
+      swap_backup="${swap_new}.old"
+      ln "$swap_path" "$swap_backup" || return 1
+    fi
+    swap_new_installed=1
+    mv -f "$swap_new" "$swap_path" || return 1
+    swapon --options="$swap_options" "$swap_path" >>"$RUN_LOG" 2>&1 || return 1
+  fi
+  if [ "$swap_action" != remove ]; then
+    swap_commit_fstab || return 1
+    swap_committed=1
+  fi
+  # 仅重新加载自动生成的单元，不启停其他交换设备。
+  if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >>"$RUN_LOG" 2>&1 || {
+      log_error "交换配置已更新，但 systemd daemon-reload 执行失败。"
+      return 1
+    }
+  fi
+  printf '%s\n' '交换配置已更新。' >>"$RUN_LOG"
+)
+
+# memory_ok 最小容量KiB 安装磁盘GB
+# 只要交换操作失败就终止安装，即使现有内存本身满足需求。
+##################################################################################################
+# 函数名：memory_ok
+# 功能：执行交换配置并校验内存+交换总容量是否达到最低要求；交换失败直接判定失败
+# 全局变量: setup_only noswap
+# 选项说明:
+#   $1：最小总内存容量(KiB)，默认1048576
+#   $2：安装磁盘容量(GB)，默认1
+# 返回值: 0=满足要求，1=不满足或交换操作失败
+# 依赖：swap_setup、awk、kb_size_h、log_error
+##################################################################################################
+memory_ok() {
+  if [ -n "$setup_only" ] || [ -n "$noswap" ]; then return 0; fi
+  min_mem=${1:-1048576}
+  swap_setup "${2:-1}" || return 1
+  all_mem=$(awk '$1 == "MemTotal:" || $1 == "SwapTotal:" {n += $2} END {printf "%.0f\n", n}' /proc/meminfo)
+  if [ "$all_mem" -lt "$min_mem" ]; then
+    log_error "内存加交换总容量小于 $(kb_size_h "$min_mem")。"
+    return 1
+  fi
+  return 0
+}
 ##################################################################################################
 # 函数名：mk_underline
 # 功能：生成并打印蓝色 Unicode 实心水平分隔线；交互式终端自动读取终端宽度，非交互固定80列
@@ -2246,26 +2878,26 @@ memory_ok() {
 # 备注：使用 Unicode U+2500 制表符「─」实心横线，无字符间隙；若终端不支持 Unicode 会显示方框/问号
 ##################################################################################################
 mk_underline() {
-    local term_cols
-    if [ "${INTERACTIVE_MODE}" != "off" ]; then
-        term_cols=$(tput cols 2>/dev/null)
-    else
-        term_cols=80
-    fi
-    local max_width=80
-    if [ "$term_cols" -gt "$max_width" ]; then
-        term_cols=$max_width
-    fi
+  local term_cols
+  if [ "${INTERACTIVE_MODE}" != "off" ]; then
+    term_cols=$(tput cols 2>/dev/null)
+  else
+    term_cols=80
+  fi
+  local max_width=80
+  if [ "$term_cols" -gt "$max_width" ]; then
+    term_cols=$max_width
+  fi
 
-    # 先开启蓝色，循环只打印 "-"，不每次重置颜色！
-    printf "${BLUE}"
-    local i=0
-    while [ "$i" -lt "$term_cols" ]; do
-        printf "─"
-        i=$((i + 1))
-    done
-    # 整根横线打完，再一次性重置颜色 + 换行
-    printf "${NORMAL}\n"
+  # 先开启蓝色，循环只打印 "-"，不每次重置颜色！
+  printf "${BLUE}"
+  local i=0
+  while [ "$i" -lt "$term_cols" ]; do
+    printf "─"
+    i=$((i + 1))
+  done
+  # 整根横线打完，再一次性重置颜色 + 换行
+  printf "${NORMAL}\n"
 }
 ##################################################################################################
 # 函数名：password
@@ -2608,41 +3240,41 @@ init_package_manager() {
 #   8. OFI dnf/yum 分支使用 eval 执行离线查询命令，用于兼容离线场景的命令封装
 ##################################################################################################
 check_install() {
-    DEBIAN_FRONTEND="noninteractive"
-    local package installed cmd check_str
-    case "$install_cmd" in
-    apt | apt-get) check_str="(none)" ;;
-    dnf | yum) check_str="Available Packages" ;;
-    *) return 0 ;;
+  DEBIAN_FRONTEND="noninteractive"
+  local package installed cmd check_str
+  case "$install_cmd" in
+  apt | apt-get) check_str="(none)" ;;
+  dnf | yum) check_str="Available Packages" ;;
+  *) return 0 ;;
+  esac
+
+  for package in "$@"; do
+    installed=""
+    cmd=""
+    case "$menu:$install_cmd" in
+    "OLI:"*)
+      installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
+      cmd="$install $package"
+      ;;
+    "OFI:dnf" | "OFI:yum")
+      installed=$(LC_ALL=C LANG=C eval $offline_info "$package" 2>/dev/null)
+      cmd="$offline_install $package"
+      ;;
+    "OFI:apt" | "OFI:apt-get")
+      installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
+      cmd="$install $package"
+      ;;
+    *) continue ;;
     esac
 
-    for package in "$@"; do
-        installed=""
-        cmd=""
-        case "$menu:$install_cmd" in
-        "OLI:"*)
-            installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
-            cmd="$install $package"
-            ;;
-        "OFI:dnf" | "OFI:yum")
-            installed=$(LC_ALL=C LANG=C eval $offline_info "$package" 2>/dev/null)
-            cmd="$offline_install $package"
-            ;;
-        "OFI:apt" | "OFI:apt-get")
-            installed=$(LC_ALL=C LANG=C $install_info "${package}" 2>/dev/null)
-            cmd="$install $package"
-            ;;
-        *) continue ;;
-        esac
-
-        if [ -z "$installed" ]; then
-            log_debug "无法获取 $package 的安装信息"
-        elif echo "$installed" | grep -qE "$check_str"; then
-            [ -n "$cmd" ] && run ok "$cmd" "安装 $package"
-        else
-            log_debug "$package 已安装"
-        fi
-    done
+    if [ -z "$installed" ]; then
+      log_debug "无法获取 $package 的安装信息"
+    elif echo "$installed" | grep -qE "$check_str"; then
+      [ -n "$cmd" ] && run ok "$cmd" "安装 $package"
+    else
+      log_debug "$package 已安装"
+    fi
+  done
 }
 
 ##################################################################################################

@@ -791,13 +791,15 @@ read_esc_seq() {
 # 依赖函数：
 #   read_char：从终端读取单个原始字符
 #   read_esc_seq：读取 ESC 之后的 ANSI 转义序列剩余字符
-# 返回：stdout第1行：enter/space/up/down/left/right/all/none/delete；第2行原始按键字节
+# 返回：stdout第1行：enter/space/up/down/left/right/all/deselect_all/delete；第2行原始按键字节
 # 备注：
-#   1. 支持 Vim 格字母快捷键 j/k/h/l；支持 ANSI ESC 方向键、Delete 功能键
+#   1. 支持 Vim 风格字母快捷键；竖向菜单(select_updown/multiselect)共用 j/k；横向菜单(select)使用 h/l；
+#      multiselect 额外快捷键：a/A=全选，n/N=取消全选；同时支持 ANSI ESC 方向键、Delete 功能键
 #   2. 回车(\r)、换行(\n)统一识别为 enter
 #   3. 输出第2段原始字节**不带末尾换行**，保留按键原始序列
 #   4. 兼容 sh / dash / bash，底层读取 /dev/tty
-#   5. 未知按键/无法识别的转义序列，token 固定返回 none
+#   5. 修复：取消全选语义 token 由原来 none 重命名为 deselect_all，消除与【未知按键(none)】命名冲突；
+#      未知按键/无法识别的转义序列，token 固定返回 none
 ##################################################################################################
 key_input() {
   local ch=""           # 保存单次读取到的原始字符
@@ -821,14 +823,12 @@ key_input() {
   # 其他字符，按当前模式做Vim风格按键映射
   else
     case "$CURR_INPUT_MODE:$ch" in
-    select_updown:[kK]) key_name="up" ;;   # select_updown模式：k/K = 向上
-    select_updown:[jJ]) key_name="down" ;; # select_updown模式：j/J = 向下
-    select:[hH]) key_name="left" ;;        # select模式：h/H = 左
-    select:[lL]) key_name="right" ;;       # select模式：l/L = 右
-    multiselect:[kK]) key_name="up" ;;     # multiselect多选模式：k/K = 向上
-    multiselect:[jJ]) key_name="down" ;;   # multiselect多选模式：j/J = 向下
-    multiselect:[aA]) key_name="all" ;;    # multiselect多选模式：a/A = 全选
-    multiselect:[nN]) key_name="none" ;;   # multiselect多选模式：n/N = 取消全选
+    select_updown:[kK] | multiselect:[kK]) key_name="up" ;;   # 竖向菜单 k/K向上（单选+多选共用）
+    select_updown:[jJ] | multiselect:[jJ]) key_name="down" ;; # 竖向菜单 j/J向下（单选+多选共用）
+    select:[hH]) key_name="left" ;;                           # select模式：h/H = 左
+    select:[lL]) key_name="right" ;;                          # select模式：l/L = 右
+    multiselect:[aA]) key_name="all" ;;                       # multiselect多选模式：a/A = 全选
+    multiselect:[nN]) key_name="deselect_all" ;;              # multiselect多选模式：n/N = 取消全选
     *)
       # 捕获ESC开头的ANSI转义序列（方向键、Delete等功能键）
       if [ "$ch" = "$ESC" ]; then
@@ -896,9 +896,9 @@ ui_mode_final() {
 #       文本输入支持：Backspace(退格删除光标左侧)、Delete(删除光标右侧)、←→左右方向键；
 #       支持光标中间位置插入/删除字符；输入模式过滤上下方向键；
 #       内置三种选择菜单模式：
-#         1. select_updown：竖向列表，↑↓方向键单选菜单
-#         2. multiselect：竖向列表多选菜单，空格切换勾选，a全选，n全取消
-#         3. select：横向单行，←→方向键 / h/l快捷键单选菜单
+#           1. select_updown：竖向列表，↑↓方向键单选菜单；Vim快捷键 k/K上，j/J下
+#           2. multiselect：竖向列表多选菜单，空格切换勾选，a全选，n全取消；Vim快捷键 k/K上，j/J下
+#           3. select：横向单行，←→方向键 / h/l快捷键单选菜单；Vim快捷键 h/H左，l/L右
 #       交互结束结果存入全局变量 reply；多选模式结果使用 | 竖线分隔多个选中项。
 #
 # 全局变量契约（调用前必须预先定义）：
@@ -908,24 +908,24 @@ ui_mode_final() {
 #
 # 参数说明：
 #   $1 交互模式
-#       enter           常规输入，携带 prompt+Index 序号提示符
-#       error           数字选择重输提示（输入非法后复用）
-#       domain_erro     域名格式错误重输提示
-#       secret          密码输入，屏幕显示*掩码，明文原始值存入reply
-#       info            普通自定义提示文本输入
-#       select_updown   上下箭头竖向选择菜单
-#                           $2=ui_mode(keep/clear/fullclear)
-#                           $3=菜单标题
-#                           $4=选项字符串，多个选项使用 | 竖线分隔
-#                           兼容旧调用：省略ui_mode，直接传标题、选项，自动使用keep模式
-#       multiselect     竖向多选菜单
-#                           $2=ui_mode(keep/clear/fullclear)
-#                           $3=菜单标题
-#                           $4=选项字符串，多个选项使用 | 竖线分隔
-#                           兼容旧调用：省略ui_mode，直接传标题、选项，自动使用keep模式
-#       select          横向单行单选菜单
-#                           $2=菜单标题
-#                           $3=选项字符串，多个选项使用 | 竖线分隔
+#         enter           常规输入，携带 prompt+Index 序号提示符
+#         error           数字选择重输提示（输入非法后复用）
+#         domain_erro     域名格式错误重输提示
+#         secret          密码输入，屏幕显示*掩码，明文原始值存入reply
+#         info            普通自定义提示文本输入
+#         select_updown   上下箭头竖向选择菜单
+#                             $2=ui_mode(keep/clear/fullclear)
+#                             $3=菜单标题
+#                             $4=选项字符串，多个选项使用 | 竖线分隔
+#                             兼容旧调用：省略ui_mode，直接传标题、选项，自动使用keep模式
+#         multiselect     竖向多选菜单
+#                             $2=ui_mode(keep/clear/fullclear)
+#                             $3=菜单标题
+#                             $4=选项字符串，多个选项使用 | 竖线分隔
+#                             兼容旧调用：省略ui_mode，直接传标题、选项，自动使用keep模式
+#         select          横向单行单选菜单
+#                             $2=菜单标题
+#                             $3=选项字符串，多个选项使用 | 竖线分隔
 #
 #   $2  提示/标题：secret/info模式为输入提示文本；select/select_updown/multiselect为菜单标题
 #   $3  菜单模式：选项字符串，多个选项使用 | 竖线分隔
@@ -939,35 +939,39 @@ ui_mode_final() {
 # 外部依赖：
 #   系统工具：stty、dd、awk、cut、tput；直接读写 /dev/tty，不受stdout/stdin管道重定向影响
 #   外部自定义函数：trim() 字符串去首尾空白；clear_menu() 清除N行菜单残留；ui_mode_final() UI收尾恢复终端
+#   外部按键解析：key_input()，输出按键语义token；修复后multiselect取消全选token为 deselect_all（不再复用none）
 #
 # 按键映射：
-#   Enter(回车)                 确认、结束交互
-#   Backspace       \b / \177   删除光标左侧字符
-#   Delete          \033[3~     删除光标右侧字符
-#   ↑               \033 [A      select_updown/multiselect 菜单上移；文本输入模式忽略
-#   ↓               \033 [B      select_updown/multiselect 菜单下移；文本输入模式忽略
-#   ←               \033 [D      光标左移 /select 横向菜单向左选择
-#   →               \033 [C      光标右移 /select 横向菜单向右选择
-#   h/H j/J k/K l/L             菜单 vi 风格方向快捷键
-#   space (空格)                 multiselect：切换当前行勾选状态
-#   a/A                         multiselect：全部勾选
-#   n/N                         multiselect：全部取消勾选
-#  已知限制与注意事项：
-#   1. 菜单项内容**不能包含竖线 |**，会被当作选项分隔符；多选返回结果同样用 | 分隔；
-#   2. 不支持多字节中文光标精确定位，中文会造成光标偏移错位；
-#   3. stty 修改终端属性，函数内部成对恢复；脚本异常中断会造成终端异常，建议脚本增加 trap 捕获信号恢复终端；
-#   4. 只支持单行输入，不支持换行；
-#   5. reply、charcount、sel_index 等为函数作用域全局变量，多次调用 task 会覆盖，需要及时读取 reply；
-#   6. 不支持 Home、End、PageUp/PageDown 等扩展按键。
+#   Enter(回车)                   确认、结束交互
+#   Backspace     \b / \177       删除光标左侧字符
+#   Delete        \033[3~         删除光标右侧字符
+#   ↑             \033[A          select_updown/multiselect 菜单上移；文本输入模式忽略
+#   ↓             \033[B          select_updown/multiselect 菜单下移；文本输入模式忽略
+#   ←             \033[D          光标左移 / select横向菜单向左选择
+#   →             \033[C          光标右移 / select横向菜单向右选择
+#   k/K j/J                       竖向菜单(select_updown、multiselect共用)Vim方向快捷键
+#   h/H l/L                       横向单行select菜单Vim方向快捷键
+#   space (空格)                  multiselect：切换当前行勾选状态
+#   a/A                           multiselect：全部勾选(token: all)
+#   n/N                           multiselect：全部取消勾选(token: deselect_all)
+#
+# 已知限制与注意事项：
+#   1. 菜单项内容**不能包含竖线 |**，会被当作选项分隔符；多选返回结果同样用 | 分隔；
+#   2. 不支持多字节中文光标精确定位，中文会造成光标偏移错位；
+#   3. stty 修改终端属性，函数内部成对恢复；脚本异常中断会造成终端异常，建议脚本增加 trap 捕获信号恢复终端；
+#   4. 只支持单行输入，不支持换行；
+#   5. reply、charcount、sel_index 等为函数作用域全局变量，多次调用 task 会覆盖，需要及时读取 reply；
+#   6. 不支持 Home、End、PageUp/PageDown 等扩展按键。
+#   7. 内部依赖 key_input；修复命名冲突：multiselect取消全选语义token改为 deselect_all；none仅保留用于未知按键。
 # 简单调用示例：
-#   task info "请输入名称"
-#   echo "输入结果：$reply"
-#   task select_updown keep "请选择环境" "prod|test|dev"
-#   echo "选中：$reply"
-#   task multiselect keep "选择组件" "SSH|Docker|Nginx"
-#   echo "多选结果：$reply"
-#   task select "选择协议" "http|https"
-#   echo "选中：$reply"
+#   task info "请输入名称"
+#   echo "输入结果：$reply"
+#   task select_updown keep "请选择环境" "prod|test|dev"
+#   echo "选中：$reply"
+#   task multiselect keep "选择组件" "SSH|Docker|Nginx"
+#   echo "多选结果：$reply"
+#   task select "选择协议" "http|https"
+#   echo "选中：$reply"
 ##################################################################################################
 task() {
   reply=''        # 全局输出结果变量，函数执行结束后外部读取该变量获取交互返回值
@@ -986,7 +990,6 @@ task() {
   ARROW='➤'
   DOT_FILLED='●'
   DOT_EMPTY='○'
-
   # 根据第一个参数分发交互模式
   case "$1" in
   enter)
@@ -1069,7 +1072,6 @@ task() {
     sel_count=$(printf "%s" "$sel_items" | awk -F'|' '{print NF}')
     ;;
   esac
-
   ###########################################################################
   # select_updown 竖向单选菜单
   # key_input 返回token：enter/up/down，使用get_item读取|分割字段
@@ -1095,7 +1097,6 @@ task() {
       printf "\n"
       i=$((i + 1))
     done
-
     CURR_INPUT_MODE="select_updown"
     # 隐藏光标，开启cbreak关闭回显，原始终端按键读取
     tput civis 2>/dev/null
@@ -1134,10 +1135,9 @@ task() {
     ui_mode_final "$draw_lines"
     return 0
   fi
-
   ###########################################################################
   # multiselect 竖向多选菜单
-  # token：enter确认、space翻转勾选、all全选、none全取消、up/down移动光标
+  # token：enter确认、space翻转勾选、all全选、deselect_all全取消、up/down移动光标
   # 返回值reply使用 | 拼接全部选中的选项
   ###########################################################################
   if [ "$1" = "multiselect" ]; then
@@ -1165,7 +1165,6 @@ task() {
       fi
       i=$((i + 1))
     done
-
     CURR_INPUT_MODE="multiselect"
     tput civis 2>/dev/null
     stty cbreak -echo 2>/dev/null
@@ -1239,8 +1238,8 @@ task() {
         done
         sel_selected="$new_sel"
         ;;
-      none)
-        # none按键：全部置false，全部取消选择
+      deselect_all)
+        # deselect_all 按键：全部置false，全部取消选择
         new_sel=""
         ii=0
         while [ "$ii" -lt "$sel_count" ]; do
@@ -1256,7 +1255,6 @@ task() {
     ui_mode_final "$draw_lines"
     return 0
   fi
-
   ###########################################################################
   # select 横向单行单选菜单
   # token：enter确认、left向左切换、right向右切换
@@ -1319,7 +1317,6 @@ task() {
     tput cnorm 2>/dev/null
     return 0
   fi
-
   ###########################################################################
   # enter / secret / info / error / domain_erro 单行文本输入编辑器
   # key_input输出：token区分按键类型，char存放普通字符

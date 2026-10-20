@@ -1737,25 +1737,124 @@ set_hostname() {
       hostname "$line"
       echo "$line" >/etc/hostname
       hostnamectl set-hostname "$line" 1>/dev/null 2>&1
-      # 适配云服务器 cloud‑init，防止主机名被云平台覆盖
       set_hostname_cloud
-      # 重新检测本机IP
-      detect_ip
-      # 截取主机短名（去掉域名部分，host.example.com → host）
-      shortname=$(echo "$line" | cut -d"." -f1)
-      # 判断 /etc/hosts 内是否已有该IP的记录
-      if grep "^$address" /etc/hosts >/dev/null; then
-        log_debug "/etc/hosts 中已存在IP $address 的记录。"
-        log_debug "正在更新为新的主机名。"
-        sed -i "s/^$address.*/$address $line $shortname/" /etc/hosts
-      else
-        log_debug "向 /etc/hosts 添加新记录：IP:$address 主机名:$line 短名:$shortname"
-        printf "%s\\t%s\\t%s\\n" "$address" "$line" "$shortname" >>/etc/hosts
-      fi
-      # 成功，跳出while循环
+      # 将 hosts 文件的执行结果向上抛出，让调用方可以终止安装流程
+      set_hosts_entry "$line" || return $?
       i=4
     fi
   done
+}
+
+##################################################################################################
+# 函数名：set_hosts_entry
+# 功能：将主机对应的主 IP 地址、主机全名与短主机名写入 /etc/hosts；
+#       保留该 IP 原有全部别名，不会覆盖清理旧别名；主机名不强制要求为 FQDN 完整限定域名。
+#       逻辑说明：
+#         1. 先校验入参主机名与全局变量 address (主 IP)是否为空，空则直接报错退出；
+#         2. 自动截取主机名第一段作为短主机名；如果传入本身就是短主机名，则不再额外添加短名；
+#         3. 使用临时文件中转更新，避免直接覆盖原文件，保护文件权限；
+#         4. awk处理规则：精确匹配目标 IP 行，跳过标记为 # Added by Google 的行不修改；
+#         5. 匹配到目标 IP 条目：重构该行，保留原有别名 (自动去重本次传入的全名/短名)、保留行尾注释；
+#         6. 未匹配到目标 IP 条目：在文件末尾追加新的 IP-主机名映射行；
+#         7. 非目标 IP 行、纯注释行原样保留不变；
+#         8. 更新完成后清理临时文件，返回写入状态码，向上抛出失败状态供调用方处理。
+#
+# 全局变量契约 (调用前必须预先定义)：
+#   address：由 detect_ip 函数填充，存放当前检测到的主IP地址
+#   日志函数：log_debug、log_warning
+#
+# 参数说明：
+#   $1  主机名，可以是 FQDN 全名，也可以是短主机名
+#
+# 返回：
+#   return 0：/etc/hosts 更新成功
+#   return 1：更新失败 (缺少 主机名/IP、临时文件创建失败、写入 hosts 文件失败)
+#
+# 外部依赖：
+#   系统工具：awk、cut、mktemp
+#   外部自定义函数：detect_ip() 用于探测本机主IP并写入全局变量 address；log_debug/log_warning 日志输出
+#
+# 特殊规则：
+#   1. 不会修改带有标记 # Added by Google 的 IP 条目；
+#   2. 自动去重：不会在同一行重复追加本次传入的主机全名、短主机名；
+#   3. 短主机名判定：以 . 分割，取第一段；全名=短名时，不再写入短别名；
+#   4. hosts 文件不存在时，自动从空源生成新文件；
+#   5. 原有行尾注释会被原样保留。
+#
+# 已知限制与注意事项：
+#   1. 仅按【精确IP】匹配条目，同一 IP 多条独立记录会被合并为单行；
+#   2. 只处理单行 hosts 条目，不支持跨行；
+#   3. 依赖detect_ip提前填充全局变量 address，调用前必须执行 detect_ip；
+#   4. 函数返回码会向上传递，调用方可以用 || return $? 中断流程；
+#   5. 不会自动排序 hosts 文件，新增条目追加在文件末尾。
+# 简单调用示例：
+#   set_hosts_entry "node01.example.com"
+#   if [ $? -ne 0 ]; then
+#     echo "hosts 条目写入失败"
+#   fi
+##################################################################################################
+set_hosts_entry() {
+  local name=$1
+  local shortname
+  local hosts_tmp
+  local hosts_status
+  local hosts_source=/etc/hosts
+  detect_ip
+  # 在修改 hosts 文件前先校验，不合法就直接退出
+  if [ -z "$name" ] || [ -z "$address" ]; then
+    log_warning "缺少主机名或 IP 地址，无法更新 /etc/hosts。"
+    return 1
+  fi
+  shortname=$(echo "$name" | cut -d"." -f1)
+  # 如果本身就是短主机名，则不再重复添加
+  if [ "$shortname" = "$name" ]; then
+    shortname=""
+  fi
+  # 先写入临时文件，避免直接覆盖原文件，保留原有权限
+  log_debug "正在 /etc/hosts 中将主机名 $name 映射到 $address。"
+  hosts_tmp=$(mktemp) || {
+    log_warning "创建用于更新 /etc/hosts 的临时文件失败。"
+    return 1
+  }
+  # 如果 hosts 文件不存在，从空源开始生成
+  [ -e "$hosts_source" ] || hosts_source=/dev/null
+  awk -v address="$address" -v name="$name" -v shortname="$shortname" '
+    # 精确匹配 IP，保留谷歌托管的标记行不改动
+    # 独立的映射条目不会和谷歌标记行互相覆盖
+    $1 == address && index($0, "# Added by Google") == 0 {
+      entry = address " " name
+      # 短主机名和全名不一致时，追加短名
+      if (shortname != "") entry = entry " " shortname
+      # 保留原有别名，不会重复写入本次指定的主机名/短名
+      comment = index($0, "#")
+      count = split(comment ? substr($0, 1, comment - 1) : $0, names)
+      for (i = 2; i <= count; i++) {
+        if (names[i] != name && names[i] != shortname)
+          entry = entry " " names[i]
+      }
+      # 保留行尾注释
+      if (comment) entry = entry " " substr($0, comment)
+      print entry
+      found = 1
+      next
+    }
+    # 其他 IP 条目、纯注释行原样保留
+    { print }
+    END {
+      # 没有找到对应 IP 的条目，则新增一行
+      if (!found) {
+        printf "%s\t%s", address, name
+        # 短主机名无需重复添加别名
+        if (shortname != "") printf "\t%s", shortname
+        printf "\n"
+      }
+    }
+  ' "$hosts_source" >"$hosts_tmp" && cat "$hosts_tmp" >/etc/hosts
+  # 记录写入结果，再清理临时文件
+  hosts_status=$?
+  rm -f "$hosts_tmp"
+  [ "$hosts_status" = 0 ] || log_warning "为主机 $name 更新 /etc/hosts 失败。"
+  return "$hosts_status"
 }
 
 ##################################################################################################
